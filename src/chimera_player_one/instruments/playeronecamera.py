@@ -175,10 +175,22 @@ class PlayerOneCamera(CameraBase):
 
     def _open(self) -> Camera:
         if self["simulated"]:
-            from chimera_player_one.sdk.simulator import FakeCameraLibrary
+            from chimera_player_one.sdk.simulator import (
+                ARES_M_PRO,
+                SEDNA_M,
+                FakeCameraLibrary,
+            )
 
             self.log.warning("running against the SIMULATED camera library")
-            return Camera.open(CameraSdk(FakeCameraLibrary()))
+            # Both bench cameras, and the same selection path as real hardware --
+            # so `model`/`serial`/`camera_index` are exercised in tests, and so a
+            # simulated run can be pointed at the awkward geometry on purpose.
+            return Camera.open(
+                CameraSdk(FakeCameraLibrary([ARES_M_PRO, SEDNA_M])),
+                serial=self["serial"],
+                model=self["model"],
+                index=int(self["camera_index"]),
+            )
         try:
             return Camera.open(
                 serial=self["serial"],
@@ -252,11 +264,18 @@ class PlayerOneCamera(CameraBase):
             mode = ReadoutMode()
             mode.mode = binning
             mode.gain = 1.0
-            # The SDK rounds ROI width down to a multiple of 4, so a mode that
-            # advertises 1002 px at bin 3 would be one the camera cannot give.
+            # The SDK rounds ROI width down to a multiple of 4 and height down to
+            # a multiple of 2, so a mode must advertise what the camera can
+            # actually deliver -- chimera validates windows against these numbers.
+            #
+            # The height rule only shows up on a sensor whose dimensions divide
+            # badly: an Ares-M PRO is 3008x3008 and every binning of it is even,
+            # so this was wrong and invisible until a Sedna-M (3096x2078) was
+            # tried, where bin 2 gives 1038 rows and not 1039.
             width = props.maxWidth // binning
+            height = props.maxHeight // binning
             mode.width = width - (width % 4)
-            mode.height = props.maxHeight // binning
+            mode.height = height - (height % 2)
             mode.pixel_width = props.pixelSize * binning
             mode.pixel_height = props.pixelSize * binning
             self._readout_modes[binning] = mode

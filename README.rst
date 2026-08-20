@@ -50,6 +50,24 @@ expose — where the first failing stage names the problem::
 
     uv run scripts/poa_probe.py --stage discover
 
+Releasing
+---------
+
+Tagging is the release; nothing else publishes::
+
+    git tag -a v0.2.0 -m "what changed"
+    git push origin v0.2.0
+
+That runs the full CI suite, checks the tag against ``pyproject.toml``'s
+version, and attaches the sdist and wheel to a GitHub release. PyPI upload is
+wired up via trusted publishing and switched on with the repository variable
+``PUBLISH_TO_PYPI``; until it is set, a tag still produces a downloadable
+release.
+
+Pull requests and pushes to ``master`` run lint, type checking and the test
+matrix (Linux x86-64 and arm64, macOS, Windows) and build the wheel, but never
+publish.
+
 Provenance
 ----------
 

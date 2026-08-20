@@ -478,3 +478,102 @@ POA Phoenix Wheel  sn=38FF67063046463922600943  7 positions
 focus offsets are all zero, so the config-vs-firmware comparison stays quiet —
 `_check_configuration_against_firmware` only warns on a *non-empty* disagreement,
 which is the right behaviour for a wheel nobody has labelled.
+
+## 2026-08-20 — 15. Testing both cameras, and the bug only the second one could find
+
+Asked whether the suite exercises both bench cameras. It did not, meaningfully --
+almost everything ran against the Ares-M PRO. That turned out to matter.
+
+**Trap — a square sensor whose dimensions divide evenly cannot test ROI
+arithmetic. [any vendor]**
+*Symptom:* geometry code that is correct for one camera and quietly off by a row
+for another.
+An Ares-M PRO is **3008x3008**: every supported binning divides it to an even
+number of rows, so the height-rounds-to-a-multiple-of-2 rule never fires. A
+Sedna-M is **3096x2078**, where it fires at bin 2 and bin 4:
+
+```
+            driver advertised    hardware delivers
+  bin 2      1548x1039            1548x1038
+  bin 4       772x519              772x518
+```
+
+`_build_readout_modes` applied the width rule and not the height rule. chimera
+validates windows against those numbers, so the driver was advertising a row the
+camera would not deliver. Fixed, and pinned with the measured values.
+
+Three things changed as a result, and the third is the one worth carrying:
+
+1. The simulated driver path now offers **both** bench cameras and goes through
+   the same `serial`/`model`/`camera_index` selection as real hardware, so tests
+   can point at the awkward geometry on purpose.
+2. A `TestSednaM` class covers the uncooled, non-square, badly-dividing case --
+   including that cooling an uncooled camera is refused *by name* rather than
+   silently doing nothing.
+3. **`tests/test_hardware.py`**: contract tests that run against every attached
+   camera, skipped when none is. The important class in it is
+   `TestFakeAgreesWithHardware`, which drives the fake and the real camera through
+   the *same* sequence and diffs the results. After being wrong twice in one day
+   (entries 9 and 14), the fake needed a test whose only job is to catch it
+   drifting -- and asking "does the fake still agree?" is cheaper and more
+   general than adding one assertion per discovered divergence.
+
+**And the hardware test immediately found a fourth thing. [Player One]**
+*Symptom:* the "is RAW16 left-shifted?" check gives opposite answers depending on
+binning.
+The low-bits trick from entry 13 works **unbinned only**. Binning defaults to
+*averaging* (`POA_PIXEL_BIN_SUM` is false), and dividing by the bin area destroys
+the signature -- at bin 4 the camera returns 210, 216, 207, which are not
+multiples of 4 at all. The conclusion (65532) was right; the probe was wrong. Both
+facts are now pinned, and the second one also tells you what binned data *is*: a
+mean, not a sum, so a binned frame gains no dynamic range.
+
+## 2026-08-20 — 16. CI, and how not to run it twice
+
+The shape, which belongs in the skill as part of the basic structure:
+
+```
+ci.yml       pull_request, push to master, and workflow_call
+             lint (ruff + ty via pre-commit)
+             test  [ubuntu, ubuntu-arm, macos, windows]
+             package  (verify provenance, build, prove every platform is in
+                       the wheel, upload the artifact)
+
+release.yml  push tags v*
+             version  (tag == pyproject version)
+             ci       (uses: ./.github/workflows/ci.yml -- not a copy)
+             github-release  (attaches the artifact ci built)
+             pypi     (trusted publishing, behind a repo variable)
+```
+
+**Trap — a bare `on: push` runs the whole suite twice for a tagged release.
+[any repo]**
+*Symptom:* two identical runs, double the minutes, and a race between them for
+any shared resource.
+GitHub fires `push` for a **tag** ref as well as a branch ref. So a workflow with
+an unfiltered `on: push` runs once when the commit lands on master and again when
+a tag is pushed at that same commit -- same tree, same result, twice. The fix is
+to filter: `ci.yml` takes `push: branches:` (which a `refs/tags/*` ref never
+matches) and `release.yml` takes `push: tags:`. Each tree is tested exactly once.
+
+**And the tag path is gated on the same jobs, not on a copy of them.**
+`release.yml` invokes `ci.yml` through `workflow_call` rather than repeating the
+steps. A duplicated pipeline drifts, and it drifts in the direction of the release
+path being *weaker* than the PR path, which is precisely backwards.
+
+Three smaller decisions with reasons:
+
+- **The wheel is built once, in `ci.yml`, and the release attaches that artifact.**
+  Rebuilding in the release job would publish a file nothing tested.
+- **`cancel-in-progress` is on for branches and off for tags.** A superseded
+  branch run is waste; a half-cancelled release is a mess.
+- **PyPI is behind `vars.PUBLISH_TO_PYPI`** and uses trusted publishing (OIDC), so
+  there is no API token in the repository to leak or rotate. Until it is switched
+  on, a tag still yields a GitHub release carrying the wheel -- which is how this
+  gets installed today, given the host application is not on PyPI either
+  (entry 10).
+
+Both non-trivial scripts in the workflows -- the wheel-contents check and the
+tag-versus-version check -- were extracted and run locally before committing,
+including the failing case for the version check. A CI script that has never been
+executed is a guess.

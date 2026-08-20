@@ -267,3 +267,75 @@ class TestCooling:
 
     def test_temperature_is_readable_before_cooling(self, camera):
         assert camera.get_temperature() == pytest.approx(25.0)
+
+
+class TestSednaM:
+    """The second bench camera, and the one that catches geometry bugs.
+
+    An Ares-M PRO is 3008x3008: every binning of it divides evenly and lands on an
+    even number of rows, so it cannot exercise the ROI rounding rules. A Sedna-M
+    is 3096x2078, where bin 2 gives 1038 rows (not 1039) and bin 4 gives 772x518
+    (not 774x519). The height-rounding bug this class pins was invisible for as
+    long as only the Ares was tested.
+
+    It is also the uncooled camera, so it covers the capability-reporting paths
+    that a cooled one cannot.
+    """
+
+    @pytest.fixture
+    def sedna(self, manager):
+        manager.add_class(
+            PlayerOneCamera, "sedna", {"simulated": True, "model": "Sedna-M"}
+        )
+        fired.clear()
+        return manager.get_proxy("/PlayerOneCamera/sedna")
+
+    def test_selects_the_right_camera_by_model(self, sedna):
+        assert sedna["camera_model"] == "Sedna-M"
+        assert sedna["ccd_model"] == "IMX178"
+        assert (sedna["ccd_width"], sedna["ccd_height"]) == (3096, 2078)
+
+    @pytest.mark.parametrize(
+        ("binning", "expected"),
+        [
+            ("1x1", (3096, 2078)),
+            ("2x2", (1548, 1038)),
+            ("3x3", (1032, 692)),
+            ("4x4", (772, 518)),
+        ],
+    )
+    def test_readout_modes_match_measured_hardware(self, sedna, binning, expected):
+        """Measured on the real Sedna-M, 2026-08-20. chimera validates windows
+        against these, so a mode advertising a row the camera will not deliver
+        accepts requests that then come back the wrong shape."""
+        mode = sedna.get_readout_modes()[sedna.get_binnings()[binning]]
+        assert (mode.width, mode.height) == expected
+
+    @pytest.mark.parametrize("binning", ["1x1", "2x2", "3x3", "4x4"])
+    def test_frames_have_the_shape_the_mode_promised(self, sedna, binning, tmp_path):
+        """The actual point: what the driver advertises and what arrives agree."""
+        mode = sedna.get_readout_modes()[sedna.get_binnings()[binning]]
+        urls = sedna.expose(
+            {"exptime": 0.02, "binning": binning, "filename": str(tmp_path / binning)}
+        )
+        path = urls[0].replace("file://", "").split(",")[0]
+        with fits.open(path) as hdus:
+            assert hdus[0].data.shape == (mode.height, mode.width)
+
+    def test_no_cooler_is_reported_honestly(self, sedna):
+        assert sedna.supports(CameraFeature.TEMPERATURE_CONTROL) is False
+
+    def test_cooling_an_uncooled_camera_is_refused_by_name(self, sedna):
+        """Refusing beats silently doing nothing: a night spent wondering why the
+        setpoint never took is worse than an error at startup."""
+        with pytest.raises(Exception, match="no cooler"):
+            sedna.start_cooling(-10)
+
+    def test_temperature_is_still_readable(self, sedna):
+        """Uncooled does not mean unmeasured -- the sensor still has a thermometer,
+        and CCD-TEMP is worth having on every frame."""
+        assert sedna.get_temperature() == pytest.approx(25.0)
+
+    def test_saturation_is_the_same_shifted_full_scale(self, sedna):
+        """Also a 14-bit sensor, so also 16383 << 2."""
+        assert sedna["ccd_saturation_level"] == 65532

@@ -1,0 +1,99 @@
+# Tagging is the release. Nothing else publishes.
+#
+#     git tag -a v0.2.0 -m "..." && git push origin v0.2.0
+#
+# That runs the full ci.yml (not a copy of it), checks the tag against the
+# version in pyproject.toml, attaches the sdist and wheel to a GitHub release,
+# and -- once trusted publishing is configured -- uploads to PyPI.
+#
+# Why this does not run twice. GitHub fires `push` for a tag as well as for a
+# branch, so a workflow with a bare `on: push` runs once for the commit landing
+# on master and again for the tag pointing at that same commit. ci.yml filters
+# its push trigger to `branches:`, which a tag ref never matches, and this
+# workflow triggers only on `tags:`. Each tree is therefore tested once, and the
+# tag run is gated on the identical job definitions via `workflow_call`.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# A release must never be cancelled halfway.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: tag matches pyproject
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The classic release footgun: tag v0.2.0, ship a wheel called 0.1, and
+      # discover it when someone reports the wrong version installed. Cheap to
+      # check, and it fails before anything is published.
+      - name: compare
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          project=$(python3 -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "tag=$tag  pyproject=$project"
+          if [ "$tag" != "$project" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match project version $project"
+            exit 1
+          fi
+
+  # The same lint / test-matrix / package jobs a pull request runs. Not a copy.
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  github-release:
+    name: github release
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      # Built once, in ci.yml. Rebuilding here would publish a different file
+      # from the one that was tested.
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - run: ls -la dist/
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'a') || contains(github.ref_name, 'b') }}
+
+  pypi:
+    name: pypi
+    needs: ci
+    runs-on: ubuntu-latest
+    # Off until the project exists on PyPI and a trusted publisher is configured
+    # for it. Set the repository variable PUBLISH_TO_PYPI to "true" to turn it on;
+    # until then a tag still produces a GitHub release with the artifacts, which
+    # is how this is installed today.
+    if: vars.PUBLISH_TO_PYPI == 'true'
+    environment:
+      name: pypi
+      url: https://pypi.org/p/chimera-player-one
+    permissions:
+      # Trusted publishing (OIDC): no API token stored in this repository, and
+      # nothing to leak or rotate.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

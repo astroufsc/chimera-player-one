@@ -67,8 +67,11 @@ class PlayerOneCamera(CameraBase):
     """
 
     __config__ = {
-        #: Serial number, the only identifier that survives a re-plug. Wins over
-        #: `model` and `camera_index` when set. Read it from `doctor`.
+        #: Serial number. **Optional**: selection is serial -> model ->
+        #: camera_index, and with none of them set you get the first camera the
+        #: SDK enumerates, which is all a single-camera host needs. Set this when
+        #: there is more than one -- it is the only selector that survives a
+        #: re-plug. Read it from `chimera-player-one-doctor`.
         "serial": None,
         #: Model name, e.g. "Ares-M PRO". Used when `serial` is unset.
         "model": None,

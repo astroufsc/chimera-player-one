@@ -53,11 +53,94 @@ def test_classloader_can_load_the_driver(clsname):
     assert loaded.__name__ == clsname
 
 
-def test_example_config_matches_the_class_names():
-    """The shipped chimera.config must name classes that actually load."""
-    config = Path(chimera_player_one.__file__).resolve().parents[2] / "chimera.config"
+def _repo_root():
+    return Path(chimera_player_one.__file__).resolve().parents[2]
+
+
+#: Same config, two syntaxes, while chimera migrates from YAML to TOML.
+EXAMPLE_CONFIGS = ["chimera.config", "chimera.toml"]
+
+
+@pytest.mark.parametrize("filename", EXAMPLE_CONFIGS)
+def test_example_config_matches_the_class_names(filename):
+    """A shipped example must name classes that actually load."""
+    config = _repo_root() / filename
     if not config.exists():
-        pytest.skip("no example config in this layout")
+        pytest.skip(f"no {filename} in this layout")
     text = config.read_text()
     for clsname in DRIVERS:
-        assert clsname in text, f"{clsname} is not in the example config"
+        assert clsname in text, f"{clsname} is not in {filename}"
+
+
+@pytest.mark.parametrize("filename", EXAMPLE_CONFIGS)
+def test_example_config_parses(filename):
+    """chimera picks its parser from the extension -- .config/.yaml/.yml are
+    YAML, .toml is TOML -- so an example in either syntax must actually load.
+
+    Both examples carry two cameras (the bench pair, whose per-sensor gain and
+    offset differ) and one filter wheel.
+    """
+    from chimera.core.chimera_config import ChimeraConfig
+
+    config = _repo_root() / filename
+    if not config.exists():
+        pytest.skip(f"no {filename} in this layout")
+    parsed = ChimeraConfig.from_file(str(config))
+    names = sorted("/" + str(url).split("/", 3)[3] for url in parsed.instruments)
+    assert names == [
+        "/PlayerOneCamera/ares",
+        "/PlayerOneCamera/sedna",
+        "/PlayerOneFilterWheel/phoenix",
+    ]
+    for url in parsed.instruments:
+        assert any(d in str(url) for d in DRIVERS), f"{url} is not one of our drivers"
+
+
+@pytest.mark.parametrize("filename", EXAMPLE_CONFIGS)
+def test_example_config_has_no_duplicate_top_level_keys(filename):
+    """A duplicated section is silently accepted and the last one wins.
+
+    This is not hypothetical: an edit to these files once left the whole camera
+    block in twice. Both parsed, both agreed with each other, and every other
+    test passed -- because the parsers keep the last duplicate and the two files
+    were duplicated identically. Only reading the file showed it. Comparing
+    parsed output cannot catch this, so compare the text.
+    """
+    config = _repo_root() / filename
+    if not config.exists():
+        pytest.skip(f"no {filename} in this layout")
+    keys = []
+    for line in config.read_text().splitlines():
+        if filename.endswith(".toml"):
+            if line.startswith("[") and not line.startswith("[["):
+                keys.append(line.strip())
+        elif line and not line[0].isspace() and line.rstrip().endswith(":"):
+            keys.append(line.strip())
+    assert len(keys) == len(set(keys)), f"duplicated section(s) in {filename}: {keys}"
+
+
+def test_the_two_examples_do_not_drift():
+    """Two examples that disagree are worse than one.
+
+    A reader has no way to tell which is authoritative, and the difference will
+    be in whichever one they are not looking at. Compare the parsed *result*,
+    not the text: that is the only comparison that survives the two syntaxes
+    legitimately differing.
+    """
+    from chimera.core.chimera_config import ChimeraConfig
+
+    root = _repo_root()
+    if not all((root / f).exists() for f in EXAMPLE_CONFIGS):
+        pytest.skip("both examples are needed for this comparison")
+
+    def summarise(filename):
+        parsed = ChimeraConfig.from_file(str(root / filename))
+        return (
+            parsed.host,
+            parsed.port,
+            {str(u): dict(v) for u, v in parsed.sites.items()},
+            {str(u): dict(v) for u, v in parsed.instruments.items()},
+        )
+
+    yaml_config, toml_config = (summarise(f) for f in EXAMPLE_CONFIGS)
+    assert yaml_config == toml_config, "chimera.config and chimera.toml have drifted"

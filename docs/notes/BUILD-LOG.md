@@ -577,3 +577,62 @@ Both non-trivial scripts in the workflows -- the wheel-contents check and the
 tag-versus-version check -- were extracted and run locally before committing,
 including the failing case for the version check. A CI script that has never been
 executed is a guess.
+
+## 2026-08-20 — 17. Two example configs, because chimera is mid-migration
+
+chimera reads both syntaxes and picks by extension: `.config`, `.yaml` and `.yml`
+go to `msgspec.yaml`, `.toml` to `msgspec.toml`
+(`chimera/core/chimera_config.py`). The default it looks for is
+`~/.chimera/chimera.config`. While the migration is in progress a plugin should
+ship **both**, with the same content and the same comments -- a user copying the
+example should not have to translate it into the syntax their site uses.
+
+So: `chimera.config` and `chimera.toml`, cross-referencing each other.
+
+**Ship the awkward case, not the tidy one.** Both examples carry **two cameras**,
+which is the bench setup and the case that makes `serial` necessary rather than
+merely advisable. It also lets the two blocks sit side by side, and the contrast
+is the whole value:
+
+| | Ares-M PRO | Sedna-M |
+|---|---|---|
+| gain range | 0-600 | 0-510 |
+| **unity gain** | **130** | **0** |
+| high-conversion-gain step | 125 | 30 |
+| lowest read noise at | 600 | 270 |
+| default offset | 35 | **50** |
+| e-/ADU at gain 0 | 4.473 | **0.920** |
+| cooler | yes | **no** |
+| USB bandwidth default | 90 | 80 |
+| sensor modes | 2 | **0** |
+
+A Sedna-M is *already* near unity gain at its minimum, so copying the Ares's
+`gain: 220` across only costs dynamic range. **An example config that is right
+for one sensor is wrong for the next**, and the fix is not a comment saying so --
+it is a second block with the real numbers in it, read off the camera.
+
+**The multi-device form is what lets the two syntaxes agree.** TOML repeats a
+table as `[[camera]]`; YAML makes `camera:` a list. chimera normalises both --
+`if not isinstance(object_configs, list): object_configs = [object_configs]`,
+with the comment *"this allow both toml and yaml to coexist"*. Shipping the
+two-camera case therefore exercises the one construct where the syntaxes visibly
+differ.
+
+**Trap — a duplicated section is silently accepted, and the last one wins.
+[any repo with config examples]**
+*Symptom:* the file is wrong, every test passes, and only reading it shows the
+problem.
+An edit here left the entire camera block in the YAML file twice. It parsed
+fine -- YAML keeps the last duplicate -- and the drift test comparing *parsed*
+output against the TOML file passed too, because both described the same thing.
+Comparing parsed output cannot catch this by construction. Fixed, and guarded by
+a test that reads the **text** and refuses repeated top-level keys, proven to
+fail against the exact broken file before being committed.
+
+Two tests keep the pair honest, and both belong in the skill:
+
+- `test_the_two_examples_do_not_drift` -- parse both, compare the results. Not
+  the text: the syntaxes legitimately differ, so only the parsed result is
+  comparable.
+- `test_example_config_has_no_duplicate_top_level_keys` -- read the text. The
+  one thing the parsed comparison structurally cannot see.

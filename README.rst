@@ -1,6 +1,38 @@
 
 The binding is ``ctypes``, so there is nothing to build on any of them.
 
+Configuration
+-------------
+
+Two runnable examples ship at the repo root, with identical content:
+``chimera.config`` (YAML) and ``chimera.toml`` (TOML). chimera picks its parser
+from the extension — ``.config``, ``.yaml`` and ``.yml`` are YAML, ``.toml`` is
+TOML — and looks for ``~/.chimera/chimera.config`` by default. Both are kept
+while chimera migrates from YAML to TOML; a test parses both and fails if they
+drift.
+
+Each carries **both bench cameras**, because the per-sensor values are not
+interchangeable and the contrast is the useful part:
+
+===============  ================  ==============
+                 Ares-M PRO        Sedna-M
+===============  ================  ==============
+sensor           IMX533 3008²      IMX178 3096×2078
+pixel            3.76 µm           2.40 µm
+cooler           yes               **no**
+gain range       0–600             0–510
+**unity gain**   **130**           **0**
+default offset   35                50
+===============  ================  ==============
+
+A Sedna-M is already 0.92 e⁻/ADU at minimum gain, so copying the Ares's
+``gain: 220`` onto it only costs dynamic range. Read your own with
+``chimera-player-one-doctor`` or ``poa_probe.py --stage config``.
+
+``serial`` is optional: selection is serial → model → ``camera_index``, and with
+none of them set you get the first camera the SDK enumerates. Set it once there
+is more than one device — USB enumeration order does not survive a re-plug.
+
 Linux: udev rules
 -----------------
 

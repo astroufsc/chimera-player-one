@@ -1,0 +1,97 @@
+# A runnable chimera site config for the Player One drivers.
+#
+#   chimera --config chimera.toml
+#
+# The TOML twin of chimera.config, with the same content and the same notes.
+# chimera picks the parser from the extension -- .toml is TOML, while .config,
+# .yaml and .yml are YAML -- and the default it looks for is
+# ~/.chimera/chimera.config. Both are kept here during the YAML-to-TOML
+# migration; edit whichever you use and keep the two in step. A test parses both
+# and fails if they drift.
+#
+# Copy it to ~/.chimera/chimera.toml and edit. Two notes before you do:
+#
+#   * `type` is the class name and it must match the driver module's filename,
+#     lowercased -- chimera has no entry points, it imports `clsname.lower()`.
+#   * `serial` is OPTIONAL. Selection is serial -> model -> camera_index, and
+#     with none of them set you get the first camera the SDK enumerates. One
+#     camera on the host: omit all three and it just works.
+#     With more than one, set `serial` -- it is the only selector that survives
+#     a re-plug, because USB enumeration order does not, and getting it wrong
+#     silently swaps which camera your script is talking to. Run
+#     `chimera-player-one-doctor` to read the serials off the attached devices.
+
+[chimera]
+host = "127.0.0.1"
+port = 7666
+
+[site]
+name = "lna"
+latitude = "-22:32:04"
+longitude = "-45:34:57"
+altitude = 1864
+
+# Two cameras on one host -- the bench setup, and the case that makes `serial`
+# necessary rather than merely advisable. Delete whichever block you do not have;
+# a single camera needs no selector at all. One device can equally be written as
+# a single [camera] table: chimera accepts either, which is what lets TOML and
+# YAML express the same config (see the "this allow both toml and yaml to
+# coexist" note in chimera/core/chimera_config.py).
+#
+# The two blocks are NOT interchangeable, and that is the point of shipping both:
+# every number below is per-sensor and comes from the camera itself. Run
+# `chimera-player-one-doctor`, or `poa_probe.py --stage config`, to read yours.
+[[camera]]
+name = "ares"
+type = "PlayerOneCamera"
+# The bench Ares-M PRO: IMX533, 3008x3008, 3.76 um, 14-bit, COOLED.
+serial = "CAMD03F2895002109000"
+image_format = "RAW16"
+# Gain range on this sensor is 0-600, and unity gain is 130 (1.0014 e-/ADU).
+# 220 sits above the high-conversion-gain step at 125. At gain 0 it is
+# 4.473 e-/ADU, so gain is not a free parameter here.
+gain = 220
+offset = 35
+# Uncomment to cool at startup -- this camera has a TEC. Leave unset to leave
+# the cooler alone; a setpoint applied on a warm afternoon just runs it flat
+# out.
+# temperature_setpoint = -10
+#
+# Needed for the WCS cards. Without it chimera writes no WCS at all, and a
+# plate solve then has nothing to start from.
+# telescope_focal_length = 1000
+
+[[camera]]
+name = "sedna"
+type = "PlayerOneCamera"
+# The bench Sedna-M: IMX178, 3096x2078, 2.40 um, 14-bit, NO COOLER, ST4.
+serial = "CAMGE0E2182022109000"
+image_format = "RAW16"
+# Do NOT copy the Ares's gain here. This sensor's range is 0-510 and its
+# unity gain is **0** -- it is already 0.92 e-/ADU at minimum gain, so
+# raising gain only costs dynamic range. Its high-conversion-gain step is at
+# 30, and lowest read noise at 270.
+gain = 0
+# Also per-sensor: this camera's default offset is 50, not the Ares's 35.
+offset = 50
+# No TEC on this model. Setting `temperature_setpoint` here is refused by
+# name at startup rather than silently ignored -- but the sensor temperature
+# is still readable and still lands in CCD-TEMP.
+#
+# This one negotiates USB3, so it reads out considerably faster than the
+# Ares does on a USB2 port. Lower `usb_bandwidth` (35-100, default 80) if
+# frames drop on a shared bus or a long cable.
+# usb_bandwidth = 80
+
+[filterwheel]
+name = "phoenix"
+type = "PlayerOneFilterWheel"
+# Optional, same as the camera's: omit it with a single wheel attached.
+serial = "38FF67063046463922600943"
+# Position order, 0-based, matching the physical wheel. The wheel stores its
+# own names in firmware; the driver logs a warning when the two disagree
+# rather than guessing which is right.
+filters = ["U", "B", "V", "R", "I", "Ha", "OIII"]
+# Focus offsets in the FOCUSER's units, not the wheel's. The wheel's own
+# offsets are readable via get_firmware_focus_offsets() for comparison.
+# focus_offsets = { Ha = -40, OIII = -40 }

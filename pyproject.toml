@@ -1,0 +1,127 @@
+[project]
+name = "chimera-player-one"
+version = "0.1"
+description = "Chimera plugin for Player One Astronomy cameras and filter wheels"
+readme = "README.rst"
+license = "GPL-2.0-or-later"
+authors = [
+    { name = "Paulo Henrique Silva", email = "ph.silva@gmail.com" },
+    ]
+urls = { "homepage" = "https://chimera.readthedocs.org", "source" = "https://github.com/astroufsc/chimera" }
+
+requires-python = ">=3.13"
+
+# Self-contained on purpose: the Player One SDK ships inside this wheel, so
+# there is no vendor download, no compiler and no *_LIBRARY_PATH for a user to
+# set. See docs/notes/BUILD-LOG.md, entry 2026-08-20/2.
+#
+# `chimera` is deliberately NOT here, and this is not an oversight.
+# The name `chimera` on PyPI belongs to an unrelated Python 2 package last
+# touched a decade ago; the chimera this plugin extends is astroufsc/chimera and
+# is not published. `[tool.uv.sources]` below redirects the name for THIS
+# checkout, but that override does not travel in a built wheel -- so declaring a
+# runtime dependency on `chimera` would make `pip install chimera-player-one`
+# drag in the wrong package and fail on a Python 2 syntax error. Measured; see
+# BUILD-LOG entry 10.
+#
+# It is not needed as a runtime dependency anyway: a chimera plugin is loaded by
+# chimera, so chimera is present by construction. It is in the dev group below,
+# where the path source applies, so tests and development resolve it.
+dependencies = [
+    "numpy>=1.26",
+    "astropy>=6.0",
+]
+
+[project.scripts]
+chimera-player-one-doctor = "chimera_player_one.doctor:main"
+
+[tool.uv.sources]
+# The sibling checkout, not the decade-old PyPI package of the same name.
+chimera = { path = "../chimera", editable = true }
+
+[build-system]
+requires = ["uv_build>=0.7.19,<0.8.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# The vendor archives and anything we unpack while vendoring are build inputs,
+# not shipped files. The blobs under src/chimera_player_one/_sdk/ ARE shipped
+# and are deliberately not excluded here.
+source-exclude = ["vendor-work/**"]
+
+[dependency-groups]
+dev = [
+    # See the note on [project.dependencies]: chimera belongs here, not there.
+    "chimera",
+    "pre-commit>=4.1.0",
+    "pytest-cover>=3.0.0",
+    "pytest-mock>=3.14.1",
+    "pytest>=8.3.3",
+    "ruff>=0.14.4",
+    "ty>=0.0.73",
+]
+docs = ["furo>=2024.8.6", "sphinx>=8.1.3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib --cov-branch --cov-report=html -sv --continue-on-collection-errors"
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+# ANN is on so that "the high-level code and the seams are typed" is enforced by
+# the linter rather than by remembering. It is switched OFF per-file for the
+# ctypes modules below, where the arguments are opaque C values and annotating
+# them `Any` would be noise pretending to be rigour.
+select = ["N", "I", "UP", "F", "ANN"]
+ignore = [
+    "UP031", # we have lots of '%' formatted strings yet
+    "ANN401", # Any is the honest type for a ctypes handle
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Names transcribed from PlayerOneCamera.h and PlayerOnePW.h keep the vendor's
+# spelling, so a reader can grep the header for any symbol in these modules.
+"src/chimera_player_one/sdk/enums.py" = ["N801", "N815", "N816"]
+# ANN off below: these mirror C signatures, where every argument is a ctypes
+# pointer or an out-parameter. The layers a caller actually touches -- loader,
+# camera, errors and the instruments -- keep it on.
+"src/chimera_player_one/sdk/structs.py" = ["N801", "N815", "N816", "ANN"]
+"src/chimera_player_one/sdk/bindings.py" = ["N802", "N803", "N815", "N816", "ANN"]
+# The fake library must export the vendor's exact symbol names -- that is what
+# makes it substitutable for the real CDLL at the same seam.
+"src/chimera_player_one/sdk/simulator.py" = ["N802", "N803", "N815", "N816", "ANN"]
+# Tests and standalone scripts are exempt: a test name is its documentation,
+# and a PEP 723 script is read top to bottom in one sitting.
+"tests/**" = ["ANN"]
+"scripts/**" = ["ANN"]
+
+# Type checking with ty. Deliberately NOT strict: the goal is to catch the
+# mistakes that ctypes code makes easy -- a None that is dereferenced, a member
+# that does not exist on the platform being checked -- not to win an argument
+# with the checker.
+#
+# The policy, in order of how much it matters:
+#
+#   * The **seams** and the **high-level code** are checked and stay clean. That
+#     means loader.py, camera.py, the instruments, and the fake library: anything
+#     a caller or a test talks to.
+#   * The **binding layer** may take exceptions where ctypes genuinely defeats
+#     static typing -- `restype`/`argtypes` are assigned to opaque handles and a
+#     fake library is duck-typed by construction. Add them to [[tool.ty.overrides]]
+#     below, narrowly, with a reason.
+#
+# Nothing is suppressed today; the first ty run found 34 real defects in the fake
+# library (unguarded lookups that would have raised AttributeError instead of
+# returning POA_ERROR_INVALID_ID) and they were fixed rather than silenced. The
+# overrides table is a pressure valve, not a starting point.
+[tool.ty.environment]
+python-version = "3.13"
+
+[tool.ty.src]
+include = ["src", "tests", "scripts"]
+
+[tool.ruff.lint.flake8-copyright]
+notice-rgx = "(?i)# SPDX-FileCopyrightText:\\s\\d{4}(-(\\d{4}|present))*"

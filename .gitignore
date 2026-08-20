@@ -1,0 +1,32 @@
+# Deliberately NOT the chimera-zwo .gitignore. That one excludes *.so, lib/ and
+# bin/, which would silently drop the vendored Player One libraries under
+# src/chimera_player_one/_sdk/ -- the whole point of this package. Anything
+# added here must be checked against that directory first.
+
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+/dist/
+/build/
+*.egg-info/
+
+# Vendoring scratch space: archives are unpacked here, patched, and the results
+# copied into src/chimera_player_one/_sdk/. Nothing here is an input to a build.
+/vendor-work/
+
+# Environments and caches
+.venv/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+.DS_Store
+.idea/
+.vscode/
+
+# Frames. Tests write to tmp_path, but a hand-run probe or a mistyped
+# `filename` lands in the cwd, and a FITS in the repo is never wanted.
+*.fits
+*.fits.fz

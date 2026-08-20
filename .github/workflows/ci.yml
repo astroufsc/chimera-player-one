@@ -1,0 +1,139 @@
+# The definition of "green" for this repo, in one place.
+#
+# Runs on every pull request and every push to master, and is *called* by
+# release.yml so a tag is gated on exactly the same checks rather than a copy of
+# them that drifts.
+#
+# Note the `push` trigger is filtered to branches. That is deliberate: an
+# unfiltered `on: push` fires for tag pushes too, so tagging a commit that is
+# already on master would run this twice for the same tree -- once for the branch
+# and once for the tag. Tags are release.yml's business, and it calls back here.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_call:
+
+# A second push to the same branch makes the first run irrelevant. Tags are not
+# cancellable -- a half-finished release is worse than a slow one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+defaults:
+  run:
+    shell: bash
+    working-directory: chimera-player-one
+
+jobs:
+  lint:
+    name: lint and type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with: { path: chimera-player-one }
+      # pyproject.toml points `chimera` at ../chimera, so the two checkouts have
+      # to be siblings. actions/checkout refuses a path outside the workspace, so
+      # both live inside it.
+      - uses: actions/checkout@v5
+        with:
+          repository: astroufsc/chimera
+          ref: sky-viewer
+          path: chimera
+      - uses: astral-sh/setup-uv@v6
+        with: { enable-cache: true }
+      - run: uv sync --locked --all-extras --dev
+      # pre-commit runs ruff check, ruff format and ty, pinned to the same
+      # versions as the dev group.
+      - run: uv run pre-commit run --all-files
+
+  test:
+    name: test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+        with: { path: chimera-player-one }
+      - uses: actions/checkout@v5
+        with:
+          repository: astroufsc/chimera
+          ref: sky-viewer
+          path: chimera
+      - uses: astral-sh/setup-uv@v6
+        with: { enable-cache: true }
+
+      # The vendored camera library links libusb on Linux. macOS carries its own
+      # (universal, vendored beside the dylib) and Windows uses WinUSB, so this
+      # step is Linux-only by necessity, not by preference.
+      - name: install libusb
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0
+        working-directory: .
+
+      - run: uv sync --locked --all-extras --dev
+
+      # No camera on a runner and none needed: the suite drives the real ctypes
+      # layer against a fake library at the CDLL seam. What this matrix *does*
+      # test is the part that genuinely differs per platform -- which vendored
+      # blob the loader picks, and whether it loads.
+      - run: uv run pytest -q
+
+      - name: the loader finds a library on this platform
+        run: uv run chimera-player-one-doctor
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with: { path: chimera-player-one }
+      - uses: astral-sh/setup-uv@v6
+        with: { enable-cache: true }
+
+      # The vendored blobs must match the hashes recorded when they were
+      # vendored. A silent SDK swap is exactly what this catches.
+      - name: verify vendored SDK
+        run: uv run --no-project --python 3.13 python scripts/vendor_sdk.py --verify
+
+      - run: uv build
+
+      # One py3-none-any wheel carries every platform, so a missing blob is a
+      # silent, platform-specific failure for someone else. Check it is all there.
+      - name: every platform is in the wheel
+        run: |
+          python3 - <<'PY'
+          import zipfile, sys
+          names = zipfile.ZipFile(
+              next(__import__("pathlib").Path("dist").glob("*.whl"))
+          ).namelist()
+          required = [
+              "macos/libPlayerOneCamera.dylib", "macos/libPlayerOnePW.dylib",
+              "macos/libusb-1.0.0.dylib",
+              "windows/x64/PlayerOneCamera.dll", "windows/x86/PlayerOneCamera.dll",
+              "windows/x64/PlayerOnePW.dll", "windows/x86/PlayerOnePW.dll",
+          ] + [
+              f"linux/{a}/lib{s}.so"
+              for a in ("x64", "arm64", "arm32", "x86")
+              for s in ("PlayerOneCamera", "PlayerOnePW")
+          ]
+          missing = [
+              r for r in required
+              if f"chimera_player_one/_sdk/{r}" not in names
+          ]
+          if missing:
+              sys.exit("missing from the wheel: " + ", ".join(missing))
+          print(f"all {len(required)} vendored libraries present")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: chimera-player-one/dist/
+          if-no-files-found: error

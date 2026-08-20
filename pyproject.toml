@@ -4,6 +4,10 @@ version = "0.1"
 description = "Chimera plugin for Player One Astronomy cameras and filter wheels"
 readme = "README.rst"
 license = "GPL-2.0-or-later"
+# Ship the licence text inside the wheel. The Player One SDK licence requires its
+# own notice to travel with the binaries (see _sdk/LICENSE-PlayerOne.txt); ours
+# should travel too rather than living only in the repo.
+license-files = ["COPYING"]
 authors = [
     { name = "Paulo Henrique Silva", email = "ph.silva@gmail.com" },
     ]

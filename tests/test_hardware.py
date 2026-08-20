@@ -25,6 +25,7 @@ import pytest
 from chimera_player_one.sdk.bindings import CameraSdk
 from chimera_player_one.sdk.camera import Camera
 from chimera_player_one.sdk.enums import POAImgFormat
+from chimera_player_one.sdk.errors import POAError
 from chimera_player_one.sdk.simulator import (
     ARES_M_PRO,
     SEDNA_M,
@@ -40,15 +41,62 @@ def _attached():
         return []
 
 
+def _usable(model):
+    """Can we actually take a frame, or is another process using this camera?
+
+    **The SDK does not refuse a second opener.** `POAOpenCamera` succeeds on a
+    camera another process already has claimed for exclusive access -- libusb
+    warns on stderr and that is all. The contention only surfaces much later, as a
+    frame that never becomes ready, i.e. a timeout at exposure time.
+
+    So "in use" cannot be detected where you would naturally check for it. This
+    probes once, cheaply, and the module skips if the answer is no. Individual
+    tests then treat a timeout as the real failure it would be.
+    """
+    try:
+        with Camera.open(model=model) as cam:
+            cam.configure(binning=4, image_format=POAImgFormat.POA_RAW16)
+            cam.expose(0.01)
+        return True
+    except Exception:
+        return False
+
+
 ATTACHED = _attached()
-pytestmark = pytest.mark.skipif(not ATTACHED, reason="no Player One camera attached")
 MODELS = [p.model for p in ATTACHED]
+USABLE = [m for m in MODELS if _usable(m)] if MODELS else []
+
+if not ATTACHED:
+    pytestmark = pytest.mark.skip(reason="no Player One camera attached")
+elif not USABLE:
+    pytestmark = pytest.mark.skip(
+        reason=f"cameras present ({', '.join(MODELS)}) but none can expose -- "
+        "another process (a chimera instance? a viewer?) has them claimed"
+    )
+else:
+    pytestmark = pytest.mark.skipif(False, reason="")
 
 
-@pytest.fixture(params=MODELS)
+@pytest.fixture(params=USABLE or MODELS)
 def camera(request):
-    with Camera.open(model=request.param) as cam:
+    """An opened camera, or a skip if something else holds it.
+
+    A camera enumerates without being opened, so `POAGetCameraCount` succeeds even
+    while another process has it claimed for exclusive access. Only the open
+    fails. That is a legitimate state of the world -- a viewer is running, or a
+    previous run has not let go -- and it is not a test failure: skip, and say
+    which device and why, so the message is not just a libusb warning on stderr.
+    """
+    try:
+        cam = Camera.open(model=request.param)
+    except POAError as exc:
+        pytest.skip(
+            f"{request.param} could not be opened ({exc}); is another process using it?"
+        )
+    try:
         yield cam
+    finally:
+        cam.close()
 
 
 class TestEveryAttachedCamera:

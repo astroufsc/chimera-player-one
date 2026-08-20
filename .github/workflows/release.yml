@@ -8,7 +8,7 @@
 #
 # Why this does not run twice. GitHub fires `push` for a tag as well as for a
 # branch, so a workflow with a bare `on: push` runs once for the commit landing
-# on master and again for the tag pointing at that same commit. ci.yml filters
+# on the default branch and again for the tag pointing at that same commit. ci.yml filters
 # its push trigger to `branches:`, which a tag ref never matches, and this
 # workflow triggers only on `tags:`. Each tree is therefore tested once, and the
 # tag run is gated on the identical job definitions via `workflow_call`.

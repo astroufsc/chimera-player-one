@@ -1,12 +1,12 @@
 # The definition of "green" for this repo, in one place.
 #
-# Runs on every pull request and every push to master, and is *called* by
+# Runs on every pull request and every push to the default branch, and is *called* by
 # release.yml so a tag is gated on exactly the same checks rather than a copy of
 # them that drifts.
 #
 # Note the `push` trigger is filtered to branches. That is deliberate: an
 # unfiltered `on: push` fires for tag pushes too, so tagging a commit that is
-# already on master would run this twice for the same tree -- once for the branch
+# already on the default branch would run this twice for the same tree -- once for the branch
 # and once for the tag. Tags are release.yml's business, and it calls back here.
 
 name: ci
@@ -15,7 +15,7 @@ on:
   pull_request:
   push:
     branches:
-      - master
+      - main
   workflow_call:
 
 # A second push to the same branch makes the first run irrelevant. Tags are not

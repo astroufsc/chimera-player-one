@@ -1,0 +1,57 @@
+name: chimera-player-one
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+# pyproject.toml points `chimera` at ../chimera, so the two checkouts have to
+# be siblings. actions/checkout refuses a path outside the workspace, so both
+# land inside it and every step runs from the plugin's own directory.
+defaults:
+  run:
+    working-directory: chimera-player-one
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: chimera-player-one
+
+      - uses: actions/checkout@v5
+        with:
+          repository: astroufsc/chimera
+          ref: sky-viewer
+          path: chimera
+
+      - name: setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: install
+        run: uv sync --locked --all-extras --dev
+
+      - name: lint
+        run: uv run pre-commit run --all-files
+
+      - name: typecheck
+        run: uv run ty check
+
+      # No camera is attached to a runner, and none is needed: the tests drive
+      # the real ctypes layer against a fake library at the CDLL seam.
+      - name: test
+        run: uv run pytest || test $? -eq 5
+
+      # The vendored blobs must match the hashes recorded when they were
+      # vendored. A silent SDK swap is exactly the failure this catches.
+      - name: verify vendored SDK
+        run: uv run scripts/vendor_sdk.py --verify
+
+      - name: build
+        run: uv build

@@ -1,0 +1,22 @@
+repos:
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  # Ruff version. Keep in step with the `ruff` floor in the dev group, or the
+  # hook and a local `uv run ruff` can disagree about the same file.
+  rev: v0.14.4
+  hooks:
+    # Run the linter.
+    - id: ruff-check
+      args: [ --fix ]
+    # Run the formatter.
+    - id: ruff-format
+
+- repo: https://github.com/astral-sh/ty-pre-commit
+  # Same rule: pinned to the `ty` version in the dev group.
+  rev: v0.0.73
+  hooks:
+    # Type check. Checks the whole project, not just changed files: a change
+    # in one file can create a diagnostic in another, so per-file checking would
+    # give a false all-clear. Configured in pyproject.toml under [tool.ty] -- not strict, but
+    # the seams and the high-level code stay clean. See docs/notes/BUILD-LOG.md
+    # entry 7 for why the fake library is checked hardest of all.
+    - id: ty

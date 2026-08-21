@@ -60,6 +60,13 @@ offset = 35
 # Needed for the WCS cards. Without it chimera writes no WCS at all, and a
 # plate solve then has nothing to start from.
 # telescope_focal_length = 1000
+#
+# How many times to close, re-open and re-init the camera and retry a frame
+# that never arrived, before giving up on the batch. Default 1; set 0 to see
+# the raw failure during bring-up. This exists because of 2026-08-20, when
+# this camera stopped delivering frames while still answering every config
+# read -- see BUILD-LOG entry 18.
+# reconnect_attempts = 1
 
 [[camera]]
 name = "sedna"
@@ -78,9 +85,10 @@ offset = 50
 # name at startup rather than silently ignored -- but the sensor temperature
 # is still readable and still lands in CCD-TEMP.
 #
-# This one negotiates USB3, so it reads out considerably faster than the
-# Ares does on a USB2 port. Lower `usb_bandwidth` (35-100, default 80) if
-# frames drop on a shared bus or a long cable.
+# Both cameras negotiate USB3 as currently cabled (2026-08-20; the Ares was
+# on a USB2 port before that, and BUILD-LOG entry 5's 1.50 s bin-1 readout
+# was measured there). Lower `usb_bandwidth` (35-100, default 80) if frames
+# drop on a shared bus or a long cable.
 # usb_bandwidth = 80
 
 [filterwheel]

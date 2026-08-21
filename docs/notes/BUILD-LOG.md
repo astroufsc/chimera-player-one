@@ -180,11 +180,16 @@ test: a struct that is silently the wrong size reads plausible garbage.
 Note `isUSB3Speed` is **false** for the Ares-M PRO as currently plugged, so readout will be
 USB2-slow until it moves to a USB3 port. Not a bug; worth knowing before timing anything.
 
+**Superseded 2026-08-20:** the Ares was moved to a USB3 port and `doctor` now reports
+`usb3=True` for both cameras. The 1.50 s bin-1 readout in entry 6 below was measured on
+USB2 and is a floor, not a current figure.
+
 ## 2026-08-20 — 6. The whole stack, on real hardware
 
 Frames off the bench Ares-M PRO through `loader` -> `bindings` -> `camera`:
 
 ```
+(measured on USB2 -- see the note in entry 5; both cameras are on USB3 now)
 bin4: (752, 752)   uint16  mean=142.7  in 0.25 s
 bin1: (3008, 3008) uint16  mean=143.2  in 1.50 s
 window (500,500,1024,1024) -> exactly that, mean=143.1
@@ -636,3 +641,201 @@ Two tests keep the pair honest, and both belong in the skill:
   comparable.
 - `test_example_config_has_no_duplicate_top_level_keys` -- read the text. The
   one thing the parsed comparison structurally cannot see.
+
+## 2026-08-20 — 18. The night the camera stopped delivering frames
+
+A session ran 6h40m with both cameras and the wheel. Two single frames succeeded,
+at 14:42 and 14:44. At 21:19 a five-frame request from the UI failed on **every**
+frame, identically, about 20 s each:
+
+```
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1   (x6-8, ~one every 2 s)
+ERROR exposure failed   POAError: POAImageReady failed: POA_ERROR_TIMEOUT (no frame after 15.0 s for a 5.000 s exposure)
+ERROR readout failed    POAError: POAGetImageData failed: POA_ERROR_OPERATION_FAILED (operation failed)
+```
+
+It took a physical re-plug **and** a chimera restart to clear.
+
+**Trap — a Player One camera can stop delivering frames while still answering
+every config read. [Player One]**
+*Symptom:* `POAImageReady` never goes true, `POAGetImageData` returns
+`POA_ERROR_OPERATION_FAILED`, and everything else about the camera looks perfectly
+healthy — because it is.
+
+The evidence for that last part is an *absent* log line. chimera's
+`_get_headers` logs `Unable to get metadata from <location>` on any failure, and
+across the whole session there are **zero** occurrences for `/Camera/0` and zero
+`could not read camera metadata`, while `/Dome/0` and `/WeatherStation/0` are
+logged every time. `get_metadata` issues five `POAGetConfig` calls, and it
+succeeded at 21:19:47.148 and 21:20:07.274 — moments *before* each failing
+exposure. `pipe 1` is endpoint `0x81` BULK-IN; config rides EP0. So:
+
+> EP0 was fully healthy and only the bulk image endpoint was dead. This was
+> never a disconnect.
+
+Three consequences, all of which shaped the fix:
+
+- **`POA_ERROR_OPERATION_FAILED` (16) must not be read as "the camera is gone".**
+  The header attaches it both to *"maybe the camera is disconnected suddenly"*
+  (`POASetSensorMode`) and to *"the current mode is not matched"*
+  (`POAGetSensorMode`), and documents **no** `POA_ERROR_TIMEOUT` return for
+  `POAGetImageData` at all despite the function taking a timeout. So code 16 out
+  of a readout is genuinely ambiguous, and `errors.py` names it
+  `is_operation_failed` after the code rather than after any guess at its
+  meaning. Recovery keys on `is_transport` (5, 6, 9, 16); `is_disconnected` is
+  only 5 and 6.
+- **A pre-exposure health probe is worthless.** It would have passed.
+- **Re-opening in place is worth trying**, because `POAInitCamera` re-runs the
+  FPGA and sensor bring-up on a device that is still on the bus and answering.
+
+**What was actually wrong in this driver, regardless of cause.** Five things, and
+only the first is about the camera at all:
+
+1. No reconnect existed. `_open()` ran once in `__start__`; a bad handle stayed
+   bad. `Camera` was single-use too — `close()` set `_closed` and nothing cleared
+   it. Now there is `Camera.reopen()`, which re-selects **by serial**: camera IDs
+   are enumeration indices and a rescan can renumber them, so re-opening by index
+   would put the other camera's frames under this camera's name, silently.
+2. `CameraBase._base_expose` **discards what `_expose` returns** and calls
+   `_readout` anyway; the only gate is the abort flag. So every failed frame
+   fetched pixels the exposure had already reported were not there, paying the
+   transfer timeout to find out — a second, more confusing traceback per frame,
+   and about a quarter of the 100 s. `_readout` now checks a `_frame_status` flag
+   the base threw away, fires its events, and does not touch the bus.
+3. Nothing gave up. Five frames, identical failure. A failed frame now aborts the
+   rest of the batch with one message that says to power-cycle the camera and
+   notes that another opener looks identical from here.
+4. The stop was swallowed. `abort_exposure()` and `close()` dropped the
+   `POAStopExposure` result, which is one EP0 control transfer and the earliest
+   cheap evidence available. Both return it now.
+5. The timeout error was synthetic and blind: `POAError("POAImageReady", 9, ...)`,
+   indistinguishable by code from a real SDK timeout and reporting nothing.
+   `ExposureTimeoutError` now carries `camera_state`, `dropped`, `stop_error` and
+   the count of calls other threads made during the frame — and **gathers them
+   before the stop**, because the header says `POAGetDroppedImagesCount` is
+   "reset to 0 after stop capture" and the stop also flips the state out of
+   `STATE_EXPOSING`. Diagnose afterwards and both numbers are destroyed.
+
+`POAGetCameraState` and `POAGetDroppedImagesCount` had been bound since the first
+commit and never called once.
+
+**Measured after the fix, with the rig on USB3 and the libusb log hook in
+place (entry 20):** six healthy frames through a real `Manager` -- one bin-1 and
+five bin-2, 1 s each -- produce **zero** libusb warnings at `LIBUSB_DEBUG=2`, and
+the per-frame window summaries read `0 call(s) from other threads` except one
+integration-time temperature read, which is the shape the design intends. So
+`darwin_abort_transfers` is **not** ordinary vendor retry chatter that happens to
+be visible during a failure: on this hardware it does not occur on a good frame at
+all. That was a live alternative explanation and it is now closed.
+
+(Also worth having: bin-1 readout is ~0.3 s on USB3 against the 1.50 s entry 6
+measured on USB2, so the 2000 ms transfer timeout has roughly 6x headroom.)
+
+**What is still unknown, and should stay written down.** Nothing used the bulk
+endpoint between 14:44 and 21:19, so the wedge cannot be dated. `pmset -g log`
+rules out system sleep — the last power transition was 11:08:30, before chimera
+started, and there are no Sleep/Wake events between 12:00 and 23:00. No other
+process had the camera open. What remains is: our own thread concurrency (entry
+19), a cumulative wedge in the SDK or the FX3, the `POAGetImageData` bug INDIGO
+works around (entry 20), or the camera/cable/controller itself. **None of the
+changes here is a fix for a known cause.** They reduce exposure to the most
+likely one, recover from it in place, and make the next occurrence diagnosable.
+
+## 2026-08-20 — 19. An override drops the base's `@lock`, and the loss is invisible twice over
+
+**Trap — overriding a `@lock` method silently unlocks it. [any chimera plugin]**
+*Symptom:* a method that used to be serialised starts running concurrently with
+an exposure, and nothing in the source looks wrong.
+
+`chimera.core.lock.lock` sets a `__lock__` marker on the raw function, and
+`MetaObject.__new__` reads it off **the subclass's own `_dict`**. Override a
+method and the subclass's version simply never had the marker. `@override` is
+innocent here, which is worth stating because it is the natural suspect: it sets
+`__override__`, returns the same object, and strips nothing — the two decorators
+compose fine in either order.
+
+The reason it matters twice is that the marker has **two** consumers. One is the
+instance monitor. The other is `bus.py`'s `_is_locked_method`, which routes
+`@lock` methods to a per-object FIFO lane and everything else to the 64-thread
+handler pool. So an unmarked override does not merely skip a lock — it moves from
+*queued behind the exposure* to *concurrent with it*.
+
+This driver demoted six: `start_cooling`, `stop_cooling`, `get_temperature`,
+`get_set_point`, `start_fan`, `stop_fan`. In the wild, `chimera-fli` demotes five
+of six the same way — and that file *imports and uses* `@lock`, so this is not an
+unaware author, it is invisible by construction. `chimera-qhy` re-applies on all
+four it overrides.
+
+**We left all six unlocked, deliberately, and that is the interesting part.** Once
+every SDK call is serialised by the per-library lock (entry 20) and the one
+multi-call sequence is a transaction inside `Camera.start_cooling`, each of these
+is a *single* SDK call. What `@lock` would add is chimera's object monitor and
+FIFO lane — and `expose` holds those for the entire `_base_expose` loop, all
+frames plus intervals, with no default request timeout on the bus. A status panel
+calling `get_temperature` would freeze for minutes with no error. That is a worse
+failure than the one being fixed. `chimera-qhy` has exactly that shape.
+
+So the readers fall back to the last value they saw rather than waiting on a
+frame transfer, and `tests/test_concurrency.py` pins the set of demoted methods
+against a documented list, so the *next* override has to be a decision too.
+
+## 2026-08-20 — 20. INDIGO's Player One driver, read as the reference implementation
+
+Worth reading before changing anything about locking or timing here:
+`indigo_drivers/ccd_playerone/indigo_ccd_playerone.c`. Four things carried over.
+
+**One mutex per camera, held per call, never across a transaction.**
+`POAImageReady` is locked and unlocked on *every* iteration of its poll;
+`POAGetImageData` holds it for the transfer only. We now do the same, with the
+lock per *loaded library* rather than per `camera_id` — `loader.camera_library()`
+is `functools.cache`d, so both camera objects share one `CDLL`, one libusb
+context and one libusb event thread. INDIGO reaches the same place from the other
+side: its CCD and guider devices share one `usb_mutex`.
+
+**Temperature is read during integration and never during readout.** INDIGO gates
+its 5 s temperature timer on a `can_check_temperature` flag that is false for the
+whole exposure callback and re-enabled inside each one-second countdown slice.
+The dangerous window is the *readout*, not the exposure — which is why `control()`
+here is **not** gated on `is_exposing()`. Blanking a temperature widget for the
+length of a five-frame batch would be a far worse cure than the disease. The
+per-call lock gives the right shape for free: during integration it is free
+almost all the time, during the transfer a poll skips a tick.
+
+**The transfer timeout is a bare constant.** INDIGO passes a literal `2000` for
+this same 18 MB Ares frame. `ccd_asi` derives from *exposure time* only and only
+when streaming; `ccd_svb` uses a flat 100 ms and loops. Nobody sizes it by pixel
+count, and the reason is that by the time you call it `POAImageReady` has already
+said the frame is there and the header says the call "will return immediately".
+So `_TRANSFER_TIMEOUT_MS` went from an unexplained 5000 to INDIGO's 2000, with a
+comment saying why a constant is defensible.
+
+**`POA_SAFE_READOUT` is compiled out on macOS.** Verbatim:
+
+```c
+/* POA_SAFE_READOUT enables workaround for a bug in POAGetImageData().
+   Peter insists to have it disabled for MacOS. */
+#if !defined(INDIGO_MACOS)
+#define POA_SAFE_READOUT
+#endif
+```
+
+So on macOS INDIGO does not call `POAImageReady` at all; it goes straight to
+`POAGetImageData` with that 2000 ms timeout. We are on macOS, and entry 18's
+failure was precisely `POAImageReady` never returning true. That is not proof of
+anything, but it is a documented vendor-bug workaround with a platform carve-out
+that lands on exactly our platform and our symptom. Keep "poll-free readout on
+macOS" as a named fallback.
+
+And one thing **not** carried over: INDIGO has no recovery path at all. No retry,
+no reopen; `grep -n reconnect` returns zero. It would have had entry 18's night
+too. `Camera.reopen()` is new ground rather than something the field solved and
+we missed — which is a reason to be careful with it, not smug about it.
+
+**Measured, not inferred: `POAInitCamera` really does reset the camera.** The
+fake models it as resetting config and geometry, which was read off the header's
+"initialize the camera's hardware, parameters, and malloc memory" and nothing
+more — and the fake has been wrong about exactly this kind of assumption twice
+(entries 4 and 14). `TestReopenOnHardware::test_reopen_resets_the_camera` puts it
+to both cameras: gain set to a distinctive value, `reopen()`, gain is back to the
+sensor default and binning is back to 1. Both pass. So `_restore_settings()`
+after a reconnect is load-bearing, not belt-and-braces.

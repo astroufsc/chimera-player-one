@@ -241,11 +241,23 @@ class TestAbort:
         assert elapsed < 1.0, f"abort took {elapsed:.2f}s of a 600 s exposure"
 
     def test_abort_over_the_bus_ends_the_exposure(self, camera, pool, tmp_path):
-        """No timing bound here -- see the class docstring."""
+        """No timing bound here -- see the class docstring.
+
+        Waits for `expose_begin` rather than for `is_exposing()`, and that is not
+        a style choice. `CameraBase.expose` sets its exposing flag **before**
+        `_base_expose` runs `self.abort.clear()`, so an abort that lands in
+        between is set and then silently discarded -- the caller is told True and
+        the exposure runs to completion. `expose_begin` fires inside `_expose`,
+        after the clear, so waiting for it makes the test deterministic instead
+        of load-dependent. The underlying race is chimera's, not this driver's,
+        and it is worth fixing there: on hardware it means an observer's abort of
+        a 600 s sub can be ignored.
+        """
         future = pool.submit(
             camera.expose,
             {"exptime": 30.0, "binning": "4x4", "filename": str(tmp_path / "abort")},
         )
+        assert _wait_for(lambda: "expose_begin" in fired, timeout=10)
         assert _wait_for(camera.is_exposing, timeout=10)
         assert camera.abort_exposure() is True
         assert _wait_for(lambda: not camera.is_exposing(), timeout=40)

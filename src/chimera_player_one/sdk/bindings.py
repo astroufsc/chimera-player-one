@@ -28,12 +28,38 @@ faster and completely opaque to a fake library, which would receive a ``CArgObje
 it cannot write through. ``pointer`` gives the fake a ``.contents`` to assign to,
 which is what makes the seam in :mod:`chimera_player_one.sdk.simulator` possible
 at all. These calls happen per frame at most, so the allocation is irrelevant.
+
+**One lock per loaded library, held per call.** Nothing used to serialise POA
+calls on a camera handle: ``control()`` polls temperature on its own thread while
+the exposure thread polls ``POAImageReady`` and then blocks in
+``POAGetImageData``. The lock here is per *library* rather than per ``camera_id``
+because :func:`~chimera_player_one.sdk.loader.camera_library` is cached -- two
+``PlayerOneCamera`` objects share one ``CDLL``, one libusb context and one libusb
+event thread, so a second camera's temperature read lands on the same context as
+the first camera's frame. INDIGO's driver for this hardware reaches the same
+place from the other side: its CCD and guider devices share one ``usb_mutex``.
+
+The grain is deliberate. Held *per call*, so the 50 ms ``POAImageReady`` poll
+releases it between iterations and a 600 s sub does not own the bus; held across
+a whole method only where more than one call has to be atomic, which is
+:meth:`transaction` and belongs to :mod:`chimera_player_one.sdk.camera`.
+
+**And the honest limit:** this orders *our* calls against each other and never
+against the SDK's own internal transfer thread. On 2026-08-20 libusb was
+aborting bulk transfers while our Python thread was doing nothing but poll. The
+exposure-window accounting below exists to tell us whether our threads were ever
+implicated at all.
 """
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import logging
+import threading
+from collections import Counter
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import numpy as np
 
@@ -57,6 +83,52 @@ from .structs import (
 )
 
 __all__ = ["CameraSdk", "FilterWheelSdk"]
+
+#: Plain string on purpose: this layer knows nothing about chimera, but the name
+#: is under chimera's root so the messages land in its handlers and log file.
+_log = logging.getLogger("chimera.chimera_player_one.poa")
+
+
+class _ExposureWindow:
+    """One armed camera, and who armed it.
+
+    The point is the ``foreign`` counter. If a frame ever fails again, the one
+    question we cannot answer from the 2026-08-20 logs is whether anything else
+    in this process touched the handle while the exposure was in flight. This
+    answers it in one line, and it is always on: the next occurrence may be
+    months away and nobody will remember to set a flag.
+    """
+
+    def __init__(self, camera_id: int) -> None:
+        self.camera_id = camera_id
+        self.thread_id = threading.get_ident()
+        self.thread_name = threading.current_thread().name
+        self.foreign: Counter[str] = Counter()
+        self.foreign_threads: Counter[str] = Counter()
+
+
+class _LibraryState:
+    """Per-loaded-library lock and exposure bookkeeping."""
+
+    def __init__(self) -> None:
+        # RLock: _call's failure path re-enters through error_string(), and
+        # set_config() calls get_config_value_type(), which is itself a _call.
+        self.lock = threading.RLock()
+        self.windows: dict[int, _ExposureWindow] = {}
+
+
+_LIBRARY_STATE: WeakKeyDictionary[Any, _LibraryState] = WeakKeyDictionary()
+_LIBRARY_STATE_LOCK = threading.Lock()
+
+
+def _library_state(lib: Any) -> _LibraryState:
+    with _LIBRARY_STATE_LOCK:
+        state = _LIBRARY_STATE.get(lib)
+        if state is None:
+            state = _LibraryState()
+            _LIBRARY_STATE[lib] = state
+        return state
+
 
 _CONFIGURED = "_chimera_player_one_bound"
 
@@ -186,17 +258,84 @@ class CameraSdk:
         _bind(lib, _CAMERA_SIGNATURES)
         self._lib = lib
         self._value_types: dict[int, POAValueType] = {}
+        self._state = _library_state(lib)
 
     # -- plumbing ---------------------------------------------------------
 
+    @property
+    def lock(self) -> threading.RLock:
+        """The per-library lock. See the module docstring for the grain."""
+        return self._state.lock
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Hold the lock across several calls that have to be atomic.
+
+        For sequences where an interleaved call would produce a state that never
+        existed -- reading four geometry fields, or writing a cooling setpoint
+        and then enabling the cooler. Single calls do not need this; `_call`
+        already takes the lock.
+        """
+        with self._state.lock:
+            yield
+
+    def _note_foreign_call(self, name: str) -> None:
+        """Record a call made while some *other* thread has a frame in flight.
+
+        Counted, never logged here. Foreign calls during a frame are *expected*:
+        the temperature poll is deliberately allowed to run while the sensor
+        integrates, exactly as INDIGO's driver allows it. Warning on each one
+        would fire on every frame and mean nothing. What the count is for is
+        :meth:`exposure_window_summary`, which a failed exposure puts in its
+        error message -- the one question the 2026-08-20 logs could not answer.
+        """
+        ident = threading.get_ident()
+        for window in self._state.windows.values():
+            if window.thread_id != ident:
+                window.foreign[name] += 1
+                window.foreign_threads[threading.current_thread().name] += 1
+
+    def exposure_window_summary(self, camera_id: int) -> str:
+        """What else touched the library while this frame was in flight.
+
+        Read it *before* stopping the exposure -- the stop closes the window.
+        """
+        window = self._state.windows.get(int(camera_id))
+        if window is None:
+            return "no exposure window open"
+        total = sum(window.foreign.values())
+        if not total:
+            return "0 calls from other threads"
+        return (
+            f"{total} call(s) from other threads: "
+            + ", ".join(f"{n} x{c}" for n, c in window.foreign.most_common())
+            + " ("
+            + ", ".join(f"{n} x{c}" for n, c in window.foreign_threads.most_common())
+            + f"); exposing thread was {window.thread_name!r}"
+        )
+
+    def _close_window(self, camera_id: int) -> None:
+        window = self._state.windows.pop(int(camera_id), None)
+        if window is None:
+            return
+        _log.debug(
+            "poa: camera %d exposure window closed, %d call(s) from other threads",
+            window.camera_id,
+            sum(window.foreign.values()),
+        )
+
     def _call(self, name: str, *args: Any) -> None:
-        code = int(getattr(self._lib, name)(*args))
-        if code != POAErrors.POA_OK:
-            raise POAError(name, code, self.error_string(code))
+        with self._state.lock:
+            if self._state.windows:
+                self._note_foreign_call(name)
+            code = int(getattr(self._lib, name)(*args))
+            if code != POAErrors.POA_OK:
+                raise POAError(name, code, self.error_string(code))
 
     def error_string(self, code: int) -> str:
         try:
-            raw = self._lib.POAGetErrorString(int(code))
+            with self._state.lock:
+                raw = self._lib.POAGetErrorString(int(code))
         except Exception:  # noqa: BLE001 - diagnostics must never mask the error
             return ""
         return raw.decode(errors="replace") if raw else ""
@@ -211,7 +350,10 @@ class CameraSdk:
         which looks like a broken camera rather than a call-order mistake.
         :meth:`get_camera_properties` therefore calls it for you.
         """
-        return int(self._lib.POAGetCameraCount())
+        with self._state.lock:
+            if self._state.windows:
+                self._note_foreign_call("POAGetCameraCount")
+            return int(self._lib.POAGetCameraCount())
 
     def get_camera_properties(self, index: int) -> POACameraProperties:
         props = POACameraProperties()
@@ -362,10 +504,19 @@ class CameraSdk:
 
     def start_exposure(self, camera_id: int, single_frame: bool = True) -> None:
         """``single_frame`` True is Snap mode, False is continuous Video mode."""
-        self._call("POAStartExposure", int(camera_id), int(bool(single_frame)))
+        with self._state.lock:
+            self._call("POAStartExposure", int(camera_id), int(bool(single_frame)))
+            self._state.windows[int(camera_id)] = _ExposureWindow(int(camera_id))
 
     def stop_exposure(self, camera_id: int) -> None:
-        self._call("POAStopExposure", int(camera_id))
+        with self._state.lock:
+            try:
+                self._call("POAStopExposure", int(camera_id))
+            finally:
+                # Closed even when the stop failed: the window is our accounting,
+                # not the camera's state, and a wedged camera is exactly the case
+                # whose summary we most want printed.
+                self._close_window(camera_id)
 
     def get_camera_state(self, camera_id: int) -> POACameraState:
         out = ctypes.c_int()
@@ -392,13 +543,18 @@ class CameraSdk:
         if not buffer.flags["C_CONTIGUOUS"]:
             raise ValueError("image buffer must be C-contiguous")
         ptr = buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
-        self._call(
-            "POAGetImageData",
-            int(camera_id),
-            ptr,
-            ctypes.c_long(buffer.nbytes),
-            int(timeout_ms),
-        )
+        # The lock is held for the whole transfer, not per byte. This is the
+        # window INDIGO's driver protects too, and the only one where a
+        # concurrent EP0 control transfer is plausibly dangerous.
+        with self._state.lock:
+            self._call(
+                "POAGetImageData",
+                int(camera_id),
+                ptr,
+                ctypes.c_long(buffer.nbytes),
+                int(timeout_ms),
+            )
+            self._close_window(camera_id)
 
     def get_dropped_images_count(self, camera_id: int) -> int:
         out = ctypes.c_int()
@@ -453,11 +609,13 @@ class CameraSdk:
         return {name: out.value for name, out in zip(names, outs, strict=True)}
 
     def get_sdk_version(self) -> str:
-        raw = self._lib.POAGetSDKVersion()
+        with self._state.lock:
+            raw = self._lib.POAGetSDKVersion()
         return raw.decode(errors="replace") if raw else ""
 
     def get_api_version(self) -> int:
-        return int(self._lib.POAGetAPIVersion())
+        with self._state.lock:
+            return int(self._lib.POAGetAPIVersion())
 
 
 class FilterWheelSdk:

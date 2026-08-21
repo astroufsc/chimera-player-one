@@ -26,6 +26,21 @@ does nothing -- the value is cached and only reaches the hardware when
 timeout, so blocking in it makes the abort latency of a 600 s sub equal to that
 timeout. We poll ``POAImageReady`` on a short cycle, check the abort flag every
 time round, and only fetch once the frame is already waiting.
+
+**Locking grain: a method that issues more than one SDK call holds the library
+lock for its whole body; a single-call method lets ``_call`` take it per call.**
+:meth:`wait_for_image` is the deliberate exception -- it takes and releases per
+poll, so a 600 s sub does not own the bus and a temperature read gets a window
+every 50 ms. The multi-call methods, and why each is a transaction: `geometry`
+(a torn read yields a `Geometry` that never existed), `configure`, `open`,
+`reopen`, `close`, `begin_exposure` (setting the exposure time and arming must
+not have a foreign write between them) and `start_cooling` (the target/enable
+order above is load-bearing).
+
+Note what is deliberately *not* locked at the chimera layer: see the comments on
+the unlocked overrides in ``instruments/playeronecamera.py``. Once every SDK call
+is serialised here, marking a single-call getter ``@lock`` would only queue it
+behind a whole multi-frame batch.
 """
 
 from __future__ import annotations
@@ -38,23 +53,86 @@ from dataclasses import dataclass
 import numpy as np
 
 from .bindings import CameraSdk
-from .enums import POAConfig, POAImgFormat
+from .enums import POACameraState, POAConfig, POAErrors, POAImgFormat
 from .errors import POAError
 from .structs import POACameraProperties
 
-__all__ = ["Camera", "Exposure", "Geometry", "ExposureAbortedError"]
+__all__ = [
+    "Camera",
+    "Exposure",
+    "Geometry",
+    "ExposureAbortedError",
+    "ExposureTimeoutError",
+]
 
 #: How often to ask whether the frame has arrived. Short enough that an abort
 #: feels immediate, long enough not to spin a core during a 600 s sub.
 _POLL_INTERVAL = 0.05
 
-#: The header's advice for POAGetImageData is "exposure + 500 ms". By the time we
-#: call it the frame is already ready, so this only covers the transfer.
-_TRANSFER_TIMEOUT_MS = 5_000
+#: How long POAGetImageData may take. By the time it is called POAImageReady has
+#: already reported the frame is there, and the header says the call then
+#: "will return immediately" -- so this covers the handover, not the exposure and
+#: not really the bus. A constant is defensible for that, and 2 s is INDIGO's:
+#: its Player One driver passes a bare 2000 for this same 18 MB Ares frame. The
+#: field pattern across drivers is to separate the *wait* (long, polled, cheap)
+#: from the *transfer* (short constant), which the wait_for_image/read_frame
+#: split already does. Nobody sizes it by pixel count.
+_TRANSFER_TIMEOUT_MS = 2_000
+
+#: How long to wait between closing a wedged camera and re-opening it. The libusb
+#: aborts in the 2026-08-20 log arrived about one every 2 s, which is the SDK's
+#: own bulk-read timeout showing through, so this gives the stack one of those to
+#: finish tearing the pipe down. ASSUMED, not measured -- if a reconnect is ever
+#: seen to fail and then succeed on a second try, this is the number to raise.
+_REOPEN_SETTLE = 2.0
 
 
 class ExposureAbortedError(Exception):
-    """Raised when an exposure was stopped by its abort flag rather than finishing."""
+    """Raised when an exposure was stopped by its abort flag rather than finishing.
+
+    ``stop_error`` carries the failure from POAStopExposure, if it failed. A stop
+    that fails during a deliberate abort is the cheapest evidence there is that
+    the camera is in trouble, and it used to be discarded.
+    """
+
+    def __init__(self, message: str, stop_error: POAError | None = None) -> None:
+        super().__init__(message)
+        self.stop_error = stop_error
+
+
+class ExposureTimeoutError(POAError):
+    """Our own deadline expired, not the SDK's.
+
+    A distinct class because the two were otherwise indistinguishable: the
+    synthesised error carried the same function name and the same code as a real
+    POA_ERROR_TIMEOUT, so nothing downstream could tell "the camera never
+    reported a frame" from "an SDK call timed out". It subclasses POAError and
+    keeps code 9, so every existing ``except POAError`` still catches it and
+    ``is_timeout`` still holds.
+
+    The evidence rides as attributes rather than only in the message, so tests
+    assert on facts and not on prose. ``camera_state`` is the one that matters:
+    STATE_EXPOSING means the camera thinks it is still integrating and the frame
+    never came off the sensor; STATE_OPENED means the exposure was not running at
+    all, which is a different fault entirely; None means it would not even answer.
+    """
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        camera_state: POACameraState | None = None,
+        dropped: int | None = None,
+        stop_error: POAError | None = None,
+        polls: int = 0,
+        foreign_calls: str = "",
+    ) -> None:
+        super().__init__("POAImageReady", int(POAErrors.POA_ERROR_TIMEOUT), detail)
+        self.camera_state = camera_state
+        self.dropped = dropped
+        self.stop_error = stop_error
+        self.polls = polls
+        self.foreign_calls = foreign_calls
 
 
 @dataclass(frozen=True)
@@ -117,16 +195,17 @@ class Camera:
         one host enumerate in USB order, which changes when a cable is re-seated.
         """
         sdk = sdk or CameraSdk()
-        cameras = sdk.enumerate()
-        if not cameras:
-            raise POAError("POAGetCameraCount", 6, "no Player One cameras found")
-        chosen = cls._select(cameras, serial=serial, model=model, index=index)
-        sdk.open_camera(chosen.cameraID)
-        try:
-            sdk.init_camera(chosen.cameraID)
-        except POAError:
-            sdk.close_camera(chosen.cameraID)
-            raise
+        with sdk.transaction():
+            cameras = sdk.enumerate()
+            if not cameras:
+                raise POAError("POAGetCameraCount", 6, "no Player One cameras found")
+            chosen = cls._select(cameras, serial=serial, model=model, index=index)
+            sdk.open_camera(chosen.cameraID)
+            try:
+                sdk.init_camera(chosen.cameraID)
+            except POAError:
+                sdk.close_camera(chosen.cameraID)
+                raise
         return cls(sdk, chosen)
 
     @staticmethod
@@ -175,21 +254,91 @@ class Camera:
     def has_cooler(self) -> bool:
         return self._properties.has_cooler
 
-    def close(self) -> None:
+    def close(self) -> POAError | None:
         """Stop anything running and release the camera. Safe to call twice.
 
-        The stop is unconditional and its result ignored, because a camera left
-        exposing is not released cleanly and the most likely reason we are here
-        is that something already went wrong.
+        The stop is unconditional because a camera left exposing is not released
+        cleanly and the most likely reason we are here is that something already
+        went wrong. Its failure is **returned rather than discarded**: a stop that
+        fails with OPERATION_FAILED is the earliest cheap evidence that the camera
+        has stopped listening, and dropping it is how the 2026-08-20 session got
+        all the way to a 15 s timeout with nothing logged.
         """
         if self._closed:
-            return
+            return None
         self._closed = True
-        try:
-            self._sdk.stop_exposure(self._camera_id)
-        except POAError:
-            pass
-        self._sdk.close_camera(self._camera_id)
+        stop_error: POAError | None = None
+        with self._sdk.transaction():
+            try:
+                self._sdk.stop_exposure(self._camera_id)
+            except POAError as exc:
+                stop_error = exc
+            self._sdk.close_camera(self._camera_id)
+        return stop_error
+
+    def reopen(self) -> None:
+        """Close this handle and open the same camera again, then re-init it.
+
+        POAInitCamera resets the camera, so everything a caller set -- geometry,
+        format, gain, offset, cooling -- is gone when this returns. Callers must
+        re-apply; nothing here does it for them.
+
+        Selection is by the serial this object already has, never by the model,
+        index or serial the caller originally passed to `open`. Camera IDs come
+        from a bus scan and are not stable across one: with two cameras on a
+        host, an index re-selects whatever enumerates first *now*, and a camera
+        that dropped off the bus leaves the other sitting at index 0. Frames
+        arriving from the wrong camera under the right name is the one failure
+        this must not have, and it would be silent.
+
+        Why this exists at all: on 2026-08-20 a camera stopped delivering frames
+        while still answering every config read on EP0. It was present, open and
+        responsive -- only the bulk image endpoint was dead -- and nothing in the
+        driver could do anything about it but wait for a person to unplug it.
+        POAInitCamera re-runs the FPGA and sensor bring-up, which is the only
+        lever the SDK offers.
+        """
+        serial = self._properties.SN.decode() if self._properties.SN else None
+        model = self._properties.cameraModelName.decode()
+        with self._sdk.transaction():
+            # Both best-effort: a camera that will not stop or will not close is
+            # exactly the one we are trying to re-open, and refusing to continue
+            # would make the failure permanent for no gain.
+            try:
+                self._sdk.stop_exposure(self._camera_id)
+            except POAError:
+                pass
+            try:
+                self._sdk.close_camera(self._camera_id)
+            except POAError:
+                pass
+        time.sleep(_REOPEN_SETTLE)
+        with self._sdk.transaction():
+            cameras = self._sdk.enumerate()
+            if not cameras:
+                raise POAError(
+                    "POAGetCameraCount",
+                    int(POAErrors.POA_ERROR_DEVICE_NOT_FOUND),
+                    f"no Player One cameras found while re-opening {serial or model}",
+                )
+            # serial first, model only as the fall-through open() already allows
+            # for a camera that reports none -- and with two identical models and
+            # no serials this is ambiguous here exactly as it is there.
+            chosen = self._select(
+                cameras, serial=serial, model=None if serial else model, index=0
+            )
+            self._sdk.open_camera(chosen.cameraID)
+            try:
+                self._sdk.init_camera(chosen.cameraID)
+            except POAError:
+                self._sdk.close_camera(chosen.cameraID)
+                raise
+            self._properties = chosen
+            self._camera_id = chosen.cameraID
+            self._closed = False
+            # The old buffer was sized for a geometry the camera no longer has.
+            self._buffer = None
+            self._buffer_bytes = 0
 
     def __enter__(self) -> Camera:
         return self
@@ -232,6 +381,27 @@ class Camera:
         value, _ = self._sdk.get_config(self._camera_id, POAConfig.POA_TEMPERATURE)
         return float(value)
 
+    def read_if_idle(self, name: str, timeout: float = 0.0) -> float | None:
+        """Read a single-call property, but only if the library is not busy.
+
+        Returns None rather than waiting when something else holds the lock --
+        which in practice means a frame is being transferred, since that is the
+        only call that holds it for more than microseconds. Callers that must
+        never block (a status panel, a control loop) use this and fall back to
+        the last value they saw; callers that want the truth use the property.
+
+        This is what lets `get_temperature` stay unlocked at the chimera layer.
+        Marking it @lock would queue it behind an entire multi-frame batch, and
+        a temperature widget that freezes for minutes is a worse failure than
+        one that shows a value a few seconds old.
+        """
+        if not self._sdk.lock.acquire(timeout=timeout):
+            return None
+        try:
+            return float(getattr(self, name))
+        finally:
+            self._sdk.lock.release()
+
     @property
     def cooler_power(self) -> int:
         value, _ = self._sdk.get_config(self._camera_id, POAConfig.POA_COOLER_POWER)
@@ -256,10 +426,16 @@ class Camera:
         """
         if not self.has_cooler:
             raise POAError("POASetConfig", 3, f"{self._properties.model} has no cooler")
-        self._sdk.set_config(
-            self._camera_id, POAConfig.POA_TARGET_TEMP, int(round(target_c))
-        )
-        self._sdk.set_config(self._camera_id, POAConfig.POA_COOLER, True)
+        # One transaction: the two writes are a pair, and a foreign write landing
+        # between them is how you get a cooler running to a setpoint nobody asked
+        # for. This is why the chimera override does not need @lock -- the
+        # atomicity lives here, where it costs microseconds instead of queueing
+        # behind a whole multi-frame batch.
+        with self._sdk.transaction():
+            self._sdk.set_config(
+                self._camera_id, POAConfig.POA_TARGET_TEMP, int(round(target_c))
+            )
+            self._sdk.set_config(self._camera_id, POAConfig.POA_COOLER, True)
 
     def stop_cooling(self) -> None:
         if not self.has_cooler:
@@ -293,11 +469,17 @@ class Camera:
     # -- geometry ---------------------------------------------------------
 
     def geometry(self) -> Geometry:
-        """What the camera says its geometry is, right now."""
-        binning = self._sdk.get_image_bin(self._camera_id)
-        start_x, start_y = self._sdk.get_image_start_pos(self._camera_id)
-        width, height = self._sdk.get_image_size(self._camera_id)
-        image_format = self._sdk.get_image_format(self._camera_id)
+        """What the camera says its geometry is, right now.
+
+        Four reads under one transaction: a write landing between them returns a
+        Geometry describing no state the camera was ever in, and the buffer gets
+        sized from it.
+        """
+        with self._sdk.transaction():
+            binning = self._sdk.get_image_bin(self._camera_id)
+            start_x, start_y = self._sdk.get_image_start_pos(self._camera_id)
+            width, height = self._sdk.get_image_size(self._camera_id)
+            image_format = self._sdk.get_image_format(self._camera_id)
         return Geometry(binning, start_x, start_y, width, height, image_format)
 
     def configure(
@@ -313,6 +495,15 @@ class Camera:
         binning resets the window; the window last, because it is the only part
         the caller asked for precisely.
         """
+        with self._sdk.transaction():
+            return self._configure(binning, window, image_format)
+
+    def _configure(
+        self,
+        binning: int,
+        window: tuple[int, int, int, int] | None,
+        image_format: POAImgFormat,
+    ) -> Geometry:
         self._sdk.set_image_format(self._camera_id, image_format)
         self._sdk.set_image_bin(self._camera_id, binning)
         if window is None:
@@ -358,9 +549,10 @@ class Camera:
         Snap mode re-arms by calling this again; the SDK needs no stop between
         consecutive single frames.
         """
-        self.exposure_seconds = exptime
-        started_at = dt.datetime.now(dt.UTC)
-        self._sdk.start_exposure(self._camera_id, single_frame=True)
+        with self._sdk.transaction():
+            self.exposure_seconds = exptime
+            started_at = dt.datetime.now(dt.UTC)
+            self._sdk.start_exposure(self._camera_id, single_frame=True)
         return started_at
 
     def wait_for_image(
@@ -381,20 +573,72 @@ class Camera:
         to a deadline is a chimera thread parked forever.
         """
         deadline = time.monotonic() + exptime + margin
+        started = time.monotonic()
+        polls = 0
         while True:
             if abort is not None and abort.is_set():
-                self.abort_exposure()
-                raise ExposureAbortedError("exposure aborted before readout")
+                raise ExposureAbortedError(
+                    "exposure aborted before readout", self.abort_exposure()
+                )
+            polls += 1
             if self._sdk.image_ready(self._camera_id):
                 return
             if time.monotonic() > deadline:
-                self.abort_exposure()
-                raise POAError(
-                    "POAImageReady",
-                    9,
-                    f"no frame after {exptime + margin:.1f} s for a {exptime:.3f} s exposure",
+                # Ask the camera what it thinks BEFORE stopping it. The header
+                # says POAGetDroppedImagesCount is "reset to 0 after stop
+                # capture", and the stop also flips the state out of
+                # STATE_EXPOSING -- so diagnosing afterwards destroys both
+                # numbers, which is exactly what we wished we had on 2026-08-20.
+                # Before the stop, which closes the accounting window.
+                foreign = self._sdk.exposure_window_summary(self._camera_id)
+                state, dropped, rendered = self.diagnose()
+                stop_error = self.abort_exposure()
+                elapsed = time.monotonic() - started
+                detail = (
+                    f"no frame after {exptime + margin:.1f} s for a "
+                    f"{exptime:.3f} s exposure; {rendered}, {polls} polls in "
+                    f"{elapsed:.1f} s, {foreign}"
+                )
+                if stop_error is not None:
+                    detail = f"{detail}; the stop failed too: {stop_error}"
+                raise ExposureTimeoutError(
+                    detail,
+                    camera_state=state,
+                    dropped=dropped,
+                    stop_error=stop_error,
+                    polls=polls,
+                    foreign_calls=foreign,
                 )
             time.sleep(_POLL_INTERVAL)
+
+    def diagnose(self) -> tuple[POACameraState | None, int | None, str]:
+        """What the camera says about itself. Never raises.
+
+        Both calls ride EP0, the control endpoint, while frames ride the bulk
+        endpoint -- so if these answer, the camera is present and it is the image
+        pipe that has stopped, and if they do not, it is gone. Nothing else in
+        the log separates those two, and they are the difference between a
+        reconnect that will work and one that cannot.
+
+        A diagnostic that masks the original error is worse than none, so every
+        probe fails to a None and says so in the rendered string.
+        """
+        state: POACameraState | None = None
+        dropped: int | None = None
+        try:
+            state = self._sdk.get_camera_state(self._camera_id)
+        except POAError:
+            pass
+        try:
+            dropped = self._sdk.get_dropped_images_count(self._camera_id)
+        except POAError:
+            pass
+        return (
+            state,
+            dropped,
+            f"camera state={state.name if state else 'unreadable'}, "
+            f"dropped={dropped if dropped is not None else 'unreadable'}",
+        )
 
     def read_frame(self, geometry: Geometry | None = None) -> np.ndarray:
         """Fetch the waiting frame as a 2-D array, shaped ``(height, width)``.
@@ -412,12 +656,20 @@ class Camera:
             pixels = buffer
         return pixels.reshape(geometry.height, geometry.width)
 
-    def abort_exposure(self) -> None:
-        """Stop an exposure. Never raises -- the caller is already unwinding."""
+    def abort_exposure(self) -> POAError | None:
+        """Stop an exposure. Never raises -- the caller is already unwinding.
+
+        Returns the failure instead of dropping it. POAStopExposure is one
+        control transfer on EP0 and does not touch the image endpoint, so it is
+        the cheapest question there is to ask a camera you suspect has gone;
+        OPERATION_FAILED here is the earliest evidence available and it used to
+        go straight in the bin.
+        """
         try:
             self._sdk.stop_exposure(self._camera_id)
-        except POAError:
-            pass
+        except POAError as exc:
+            return exc
+        return None
 
     def expose(self, exptime: float, abort: threading.Event | None = None) -> Exposure:
         """Take one frame, start to finish. For scripts and tests.
@@ -426,9 +678,13 @@ class Camera:
         because chimera splits exposure and readout into two calls.
         """
         geometry = self.geometry()
+        # Sampled before arming, not between the wait and the readout: a
+        # millisecond before the shutter is astronomically identical to a
+        # millisecond after, and it keeps the read out of the window where the
+        # SDK has bulk transfers pending.
+        temperature = self.temperature
         started_at = self.begin_exposure(exptime)
         self.wait_for_image(exptime, abort)
-        temperature = self.temperature
         data = self.read_frame(geometry)
         return Exposure(
             data=data,

@@ -19,7 +19,12 @@ It also does what hardware will not do on request:
 * fail a named function once, with a chosen code (``fail_once``);
 * disappear mid-run, the way a USB cable does (``disconnect_after_frames``);
 * run a cooler that never reaches setpoint (``cooler_reaches_setpoint=False``);
-* return fewer bytes than the buffer expects (``short_read``).
+* return fewer bytes than the buffer expects (``short_read``);
+* stop delivering frames while still answering every config read
+  (``wedge_image_pipe``) -- the 2026-08-20 failure, which no error code
+  reproduces because the SDK never returned one;
+* hold a caller inside a named function until a test releases it (``hold_in``),
+  so a concurrency test pins threads instead of racing sleeps.
 
 Frame content is deliberately simple -- bias, read noise, a few Gaussian stars --
 because its job is to exercise the pipeline, not to be astrophysics. It is a
@@ -30,6 +35,7 @@ produce solvable star fields without any driver change.
 from __future__ import annotations
 
 import ctypes
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -210,18 +216,69 @@ class FakeCameraLibrary:
         self.cooler_reaches_setpoint = True
         self.short_read = False
         self.calls: list[str] = []
+        #: The 2026-08-20 21:19 failure on demand: EP 0x81 (BULK IN, the image
+        #: endpoint) stops delivering while EP0 keeps answering. POAImageReady
+        #: returns POA_OK and never says ready, POAGetImageData and
+        #: POAStopExposure fail with OPERATION_FAILED, and config reads keep
+        #: working -- which is exactly why the driver's own metadata reads
+        #: succeeded between failing exposures and nothing looked wrong.
+        self.wedge_image_pipe = False
+        #: Whether re-opening clears the wedge. True is the outcome the reconnect
+        #: path exists for; False is the night that needed the power removed, and
+        #: the only way to test that the driver gives up once instead of five
+        #: times.
+        self.wedge_clears_on_init = True
+        #: Wedge the image pipe once this many frames have been delivered. The
+        #: realistic shape of a mid-batch failure, and the only way to test that
+        #: the give-up message counts the frames that did arrive.
+        self.wedge_after_frames: int | None = None
+        #: The cable actually out: the bus scan stops finding anything.
+        self.detached = False
+        #: Renumber the cameras on the next bus scan. Set this rather than
+        #: calling `reorder` directly when a driver is running: POAGetCameraCount
+        #: *is* the scan, so that is the only moment enumeration order can
+        #: change under a live handle.
+        self.reorder_on_next_scan: list[int] | None = None
+        #: Gates a caller *inside* a named function until the test sets the
+        #: event. Deterministic where a sleep would be a race.
+        self.hold_in: dict[str, threading.Event] = {}
+        #: High-water mark of threads inside the library at once. The whole point
+        #: of the lock is that this never exceeds 1.
+        self.max_concurrency = 0
+        self._depth = 0
+        self._depth_lock = threading.Lock()
 
     # -- CDLL surface -----------------------------------------------------
 
     def __getattr__(self, name: str) -> _FakeFunc:
         if not name.startswith("POA"):
             raise AttributeError(name)
-        impl = self.__class__.__dict__.get(f"_{name}")
+        # Walk the MRO rather than this class's own __dict__: tests subclass the
+        # fake to get a handle on the instance the driver builds, and a lookup
+        # that stops at __dict__ makes every inherited entry point vanish.
+        impl = getattr(type(self), f"_{name}", None)
         if impl is None:
             raise AttributeError(f"{name} is not exported by the fake camera library")
-        func = _FakeFunc(lambda *args, _impl=impl: _impl(self, *args))
+        func = _FakeFunc(
+            lambda *args, _impl=impl, _n=name: self._enter(_impl, _n, args)
+        )
         setattr(self, name, func)
         return func
+
+    def _enter(self, impl, name: str, args):
+        """Every fake entry point passes through here, including the ones that
+        skip ``_guard`` (``POAGetCameraCount``). That makes it the only honest
+        place to count concurrency and to gate a caller for a test."""
+        with self._depth_lock:
+            self._depth += 1
+            self.max_concurrency = max(self.max_concurrency, self._depth)
+        try:
+            if (gate := self.hold_in.get(name)) is not None:
+                gate.wait(timeout=10)
+            return impl(self, *args)
+        finally:
+            with self._depth_lock:
+                self._depth -= 1
 
     def _guard(self, name: str) -> POAErrors | None:
         self.calls.append(name)
@@ -233,6 +290,20 @@ class FakeCameraLibrary:
 
     def _camera(self, camera_id: int) -> _CameraState | None:
         return self._cameras.get(int(camera_id))
+
+    def reorder(self, order: list[int]) -> None:
+        """Re-enumerate in a different order, as a bus rescan can.
+
+        Camera IDs here are enumeration indices, exactly as in the SDK, so this
+        is what makes "reconnect by index" pick the wrong camera. It is the
+        reason `Camera.reopen` re-selects by serial and never by index.
+        """
+        specs = [self._cameras[i].spec for i in order]
+        self._cameras = {
+            index: _CameraState(spec=spec, width=spec.width, height=spec.height)
+            for index, spec in enumerate(specs)
+        }
+        self.scanned = False
 
     # -- frame synthesis (the seam mirage would replace) ------------------
 
@@ -257,15 +328,18 @@ class FakeCameraLibrary:
 
     def _POAGetCameraCount(self):
         self.calls.append("POAGetCameraCount")
+        if self.reorder_on_next_scan is not None:
+            order, self.reorder_on_next_scan = self.reorder_on_next_scan, None
+            self.reorder(order)
         self.scanned = True
-        return len(self._cameras)
+        return 0 if self.detached else len(self._cameras)
 
     def _POAGetCameraProperties(self, index, out):
         if (err := self._guard("POAGetCameraProperties")) is not None:
             return err
         # The real SDK will not answer before its bus scan. Reproduce that, or a
         # driver that calls in the wrong order passes here and fails on hardware.
-        if not self.scanned or int(_plain(index)) not in self._cameras:
+        if not self.scanned or self.detached or int(_plain(index)) not in self._cameras:
             return POAErrors.POA_ERROR_INVALID_INDEX
         self._fill_properties(
             self._cameras[int(_plain(index))], int(_plain(index)), out
@@ -328,6 +402,19 @@ class FakeCameraLibrary:
         if state is None or not state.opened:
             return POAErrors.POA_ERROR_NOT_OPENED
         state.initialised = True
+        # The header calls this "initialize the camera's hardware, parameters,
+        # and malloc memory", so everything a caller set is gone afterwards.
+        # INFERRED FROM THE HEADER, not measured -- test_hardware.py asks the
+        # real camera the same question, because a fake that is wrong here makes
+        # every "settings were re-applied after a reconnect" test pass vacuously.
+        state.config = dict(_DEFAULT_CONFIG)
+        state.start_x = state.start_y = 0
+        state.width, state.height = state.spec.width, state.spec.height
+        state.binning = 1
+        state.image_format = POAImgFormat.POA_RAW8
+        state.exposing = False
+        if self.wedge_clears_on_init:
+            self.wedge_image_pipe = False
         return POAErrors.POA_OK
 
     def _POACloseCamera(self, camera_id):
@@ -580,6 +667,12 @@ class FakeCameraLibrary:
         state = self._camera(camera_id)
         if state is None:
             return POAErrors.POA_ERROR_INVALID_ID
+        if self.wedge_image_pipe:
+            # The stop rides EP0 and would normally work, but a camera whose
+            # streaming path is stuck does not come out of it -- and leaving
+            # `exposing` set is what makes POAGetCameraState still say
+            # STATE_EXPOSING, which is the diagnosis the driver prints.
+            return POAErrors.POA_ERROR_OPERATION_FAILED
         state.exposing = False
         state.dropped = 0
         return POAErrors.POA_OK
@@ -607,6 +700,10 @@ class FakeCameraLibrary:
             return POAErrors.POA_ERROR_INVALID_ID
         elapsed = self._clock() - state.started_at
         ready = state.exposing and elapsed >= float(state.config[POAConfig.POA_EXP])
+        if self.wedge_image_pipe:
+            # POA_OK and never ready. The SDK returned no error on 2026-08-20
+            # either; the only thing that ever gave up was our own deadline.
+            ready = False
         _deref(out).value = int(bool(ready))
         return POAErrors.POA_OK
 
@@ -616,6 +713,8 @@ class FakeCameraLibrary:
         state = self._camera(camera_id)
         if state is None or not state.exposing:
             return POAErrors.POA_ERROR_NOT_OPENED
+        if self.wedge_image_pipe:
+            return POAErrors.POA_ERROR_OPERATION_FAILED
         frame = self.render(state)
         dtype = np.uint8 if state.image_format is POAImgFormat.POA_RAW8 else "<u2"
         payload = np.ascontiguousarray(frame.astype(dtype)).tobytes()
@@ -625,6 +724,11 @@ class FakeCameraLibrary:
         n = len(payload) // 2 if self.short_read else len(payload)
         ctypes.memmove(buf, payload, n)
         state.frames += 1
+        if (
+            self.wedge_after_frames is not None
+            and state.frames >= self.wedge_after_frames
+        ):
+            self.wedge_image_pipe = True
         if state.single_frame:
             state.exposing = False
         else:
@@ -739,7 +843,7 @@ class FakeFilterWheelLibrary:
     def __getattr__(self, name: str) -> _FakeFunc:
         if not name.startswith("POA"):
             raise AttributeError(name)
-        impl = self.__class__.__dict__.get(f"_{name}")
+        impl = getattr(type(self), f"_{name}", None)
         if impl is None:
             raise AttributeError(
                 f"{name} is not exported by the fake filter wheel library"

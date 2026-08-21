@@ -24,6 +24,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import functools
+import logging
 import os
 import platform
 import sys
@@ -83,6 +84,92 @@ def _platform_dir() -> Path:
         f"no vendored Player One library for {system} {machine!r}. "
         f"Known {system} machines: {', '.join(known)}."
     )
+
+
+#: Plain string: this layer imports nothing from chimera, but the name sits under
+#: chimera's root so the messages reach its handlers and its log file.
+_libusb_log = logging.getLogger("chimera.chimera_player_one.libusb")
+
+#: libusb calls this from its own event thread, so the trampoline must outlive
+#: every call. A CFUNCTYPE that goes out of scope is freed memory that libusb
+#: will later jump to: a segfault with no Python traceback, from a thread you did
+#: not start. Hence a module global, and hence this comment.
+_LIBUSB_LOG_CB = None
+
+#: LIBUSB_LOG_LEVEL_* -> logging level. libusb's "error" is usually a failed
+#: transfer rather than a dead device, so nothing maps above WARNING: the driver
+#: decides what is fatal, not the transport.
+_LIBUSB_LEVELS = {
+    1: logging.WARNING,
+    2: logging.WARNING,
+    3: logging.INFO,
+    4: logging.DEBUG,
+}
+
+
+def _libusb_path() -> Path | None:
+    """The vendored libusb, if this platform has one beside the camera library."""
+    try:
+        directory = _platform_dir()
+    except SdkNotAvailableError:
+        return None
+    for name in ("libusb-1.0.0.dylib", "libusb-1.0.so.0"):
+        candidate = directory / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def install_libusb_log_handler() -> bool:
+    """Route libusb's own messages into the chimera log. Best-effort.
+
+    Worth the ctypes for one reason: on 2026-08-20 the only trace of the camera
+    failing was eight lines of ``libusb: warning [darwin_abort_transfers]`` on
+    **stderr**, with no timestamps, interleaved with nothing. In the log file they
+    would have been dated, attributable to a thread, and correlated with the
+    exposure that failed -- and the question of whether that 2 s abort cadence
+    also happens on healthy frames would already be answered.
+
+    libusb calls the handler *instead of* writing to stderr, so this de-noises
+    the console as well. Returns False if the hook could not be installed, which
+    is not an error: the vendor may have linked its own libusb statically, in
+    which case there is nothing to hook and we say so rather than pretending.
+    """
+    global _LIBUSB_LOG_CB
+    if _LIBUSB_LOG_CB is not None:
+        return True
+    path = _libusb_path()
+    if path is None:
+        return False
+    try:
+        # The same image dyld/ld.so already gave the camera library: loading by
+        # absolute path returns the loaded handle rather than a second copy.
+        lib = ctypes.CDLL(str(path))
+        set_log_cb = lib.libusb_set_log_cb
+    except (OSError, AttributeError):
+        return False
+
+    prototype = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p)
+
+    def _handler(_ctx: int | None, level: int, message: bytes | None) -> None:
+        # Runs on libusb's event thread and takes the GIL to do it, so this stays
+        # one call with no formatting and no I/O of its own.
+        try:
+            _libusb_log.log(
+                _LIBUSB_LEVELS.get(int(level), logging.DEBUG),
+                "%s",
+                (message or b"").decode(errors="replace").rstrip(),
+            )
+        except Exception:  # noqa: BLE001 - never raise into C
+            pass
+
+    _LIBUSB_LOG_CB = prototype(_handler)
+    set_log_cb.argtypes = [ctypes.c_void_p, prototype, ctypes.c_int]
+    set_log_cb.restype = None
+    # LIBUSB_LOG_CB_GLOBAL == 1 << 0: applies to contexts we did not create,
+    # which is every one of them -- the vendor library calls libusb_init itself.
+    set_log_cb(None, _LIBUSB_LOG_CB, 1)
+    return True
 
 
 def _preload_libusb() -> str | None:
@@ -167,7 +254,11 @@ def _load(stem: str) -> ctypes.CDLL:
 @functools.cache
 def camera_library() -> ctypes.CDLL:
     """The Player One Camera SDK, loaded once per process."""
-    return _load("PlayerOneCamera")
+    lib = _load("PlayerOneCamera")
+    # After the load, so the image is already resolved, and before any
+    # POAGetCameraCount, which is where the vendor library calls libusb_init.
+    install_libusb_log_handler()
+    return lib
 
 
 @functools.cache

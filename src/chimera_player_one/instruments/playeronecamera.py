@@ -32,7 +32,6 @@ all live one layer down and are not repeated here.
 from __future__ import annotations
 
 import datetime as dt
-import threading
 from typing import override
 
 from chimera.controllers.imageserver.imagerequest import ImageRequest
@@ -57,6 +56,17 @@ _FORMATS = {
 #: Report a temperature change above this many degrees. Small enough to track a
 #: cooldown, large enough that sensor noise does not spam the bus.
 _TEMPERATURE_EVENT_THRESHOLD = 0.5
+
+#: How long the control loop waits for the library before giving up on a tick.
+#: Non-zero so it wins against the microsecond-scale calls of an integrating
+#: exposure, short enough that it never queues behind a frame transfer -- a
+#: missed temperature sample is worth far less than a delayed control loop.
+_TEMPERATURE_POLL_TIMEOUT = 0.25
+
+#: Control-loop period, in Hz. 5 s is what INDIGO's driver ships for this
+#: hardware; the old 0.5 Hz was 2.5x the EP0 traffic for no difference a human
+#: can see on a cooling curve.
+_CONTROL_HZ = 0.2
 
 
 class PlayerOneCamera(CameraBase):
@@ -97,6 +107,16 @@ class PlayerOneCamera(CameraBase):
         #: lost. A camera that never reports ready would otherwise park a chimera
         #: thread forever.
         "exposure_timeout_margin": 10.0,
+        #: How many times to close, re-open and retry a frame that never
+        #: arrived before giving up. 0 disables recovery, for bring-up work that
+        #: wants the raw failure.
+        #:
+        #: Default 1 because the failure this exists for looks binary -- the
+        #: image endpoint either comes back on a re-init or it needs the power
+        #: removed -- so a second attempt doubles the time to the message and
+        #: buys nothing. One attempt turns the 2026-08-20 night, five frames
+        #: failing identically over 100 s, into roughly 30 s and one line.
+        "reconnect_attempts": 1,
     }
 
     def __init__(self) -> None:
@@ -109,7 +129,23 @@ class PlayerOneCamera(CameraBase):
         self._frame_started_at: dt.datetime | None = None
         self._frame_temperature: float = 0.0
         self._frame_geometry: Geometry | None = None
-        self._exposing_lock = threading.Lock()
+        #: What the last _expose decided. ERROR is the right initial value: a
+        #: _readout that was never preceded by a successful _expose must not go
+        #: near the bus. See _readout for why this flag exists at all.
+        self._frame_status: CameraStatus = CameraStatus.ERROR
+        #: The setpoint actually in force, which is not always the configured
+        #: one: start_cooling/stop_cooling do not write back to config, so a
+        #: reconnect that restored from config would silently revert a setpoint
+        #: the observer changed at run time.
+        self._cooling_setpoint: float | None = None
+        self._temperature_polls_skipped = 0
+        self._temperature_failures = 0
+        #: Frames saved so far in the request being served, so the give-up
+        #: message can say how far the batch got instead of guessing.
+        self._current_request: ImageRequest | None = None
+        self._frames_taken = 0
+        self._last_temperature_code: int | None = None
+        self._last_set_point: float | None = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -138,17 +174,18 @@ class PlayerOneCamera(CameraBase):
             CameraFeature.PROGRAMMABLE_ADC: False,
         }
 
-        self._apply_static_settings()
-
         setpoint = self["temperature_setpoint"]
         if setpoint is not None:
             if props.has_cooler:
-                self._camera.start_cooling(float(setpoint))
+                self._cooling_setpoint = float(setpoint)
             else:
+                # A config complaint, so it is said once here rather than on
+                # every reconnect.
                 self.log.warning(
                     "temperature_setpoint is set but %s has no cooler; ignoring",
                     props.model,
                 )
+        self._restore_settings()
 
         self.log.info(
             "%s (%s, %dx%d, %d-bit, %.2f um) ready; cooler=%s",
@@ -160,7 +197,7 @@ class PlayerOneCamera(CameraBase):
             props.pixelSize,
             props.has_cooler,
         )
-        self.set_hz(0.5)
+        self.set_hz(_CONTROL_HZ)
         return True
 
     @override
@@ -172,7 +209,15 @@ class PlayerOneCamera(CameraBase):
         except Exception:
             self.log.debug("abort during shutdown failed", exc_info=True)
         if self._camera is not None:
-            self._camera.close()
+            try:
+                # close() returns the stop failure rather than raising it, but
+                # POACloseCamera still can -- and the camera that fails to close
+                # is exactly the wedged one this whole driver change is about.
+                # Letting that escape takes chimera's shutdown down with it.
+                if (stop_error := self._camera.close()) is not None:
+                    self.log.info("the camera would not stop on close: %s", stop_error)
+            except Exception:
+                self.log.warning("closing the camera failed", exc_info=True)
             self._camera = None
         return True
 
@@ -253,6 +298,76 @@ class PlayerOneCamera(CameraBase):
         if self["fan_power"] is not None and camera.has_cooler:
             camera.set_fan_power(int(self["fan_power"]))
 
+    def _restore_settings(self) -> None:
+        """Everything __start__ put into the camera, applied again.
+
+        Called from __start__ and from _reconnect, so there is exactly one list
+        and it cannot drift. POAInitCamera resets the camera, so a reconnect that
+        skipped this would come back at the vendor's default gain and offset with
+        the cooler off -- and the frames it then took would look fine.
+
+        Geometry and image format are deliberately absent: `_configure_for` runs
+        per exposure, so the retry re-establishes them. That is the whole rule
+        for what is sticky here and what is not.
+        """
+        self._apply_static_settings()
+        if self._cooling_setpoint is not None:
+            self._require_camera().start_cooling(self._cooling_setpoint)
+
+    def _reconnect(self, cause: Exception) -> bool:
+        """Close the camera and open it again, by serial, and put its settings back.
+
+        Never raises: every caller is already handling a failure, and a reconnect
+        that fails must produce a message, not a second traceback on top of the
+        first.
+
+        This exists because of 2026-08-20, when a camera stopped delivering
+        frames while still answering every config read. Nothing in the driver
+        could do anything but log the same error five times and wait for someone
+        to walk over and unplug it.
+        """
+        camera = self._camera
+        if camera is None or int(self["reconnect_attempts"]) <= 0:
+            return False
+        state = getattr(cause, "camera_state", None)
+        self.log.warning(
+            "the camera stopped delivering frames (%s%s); closing and re-opening it",
+            cause,
+            f"; it still reports {state.name}" if state is not None else "",
+        )
+        try:
+            camera.reopen()
+            self._restore_settings()
+        except Exception:
+            self.log.error("re-opening the camera failed", exc_info=True)
+            return False
+        self.log.info("%s re-opened and reconfigured", camera.properties.model)
+        return True
+
+    def _stop_remaining_frames(self, requested: int) -> None:
+        """Give up on the rest of the batch, once, with something actionable.
+
+        Setting the abort event is the only lever this driver has on
+        CameraBase._base_expose's loop, and _readout is the place to pull it: the
+        abort check between _expose and _readout would skip the readout events
+        entirely, while the one after _readout stops the batch *and* still lets
+        this frame fire its full event pair. _base_expose clears the flag at the
+        start of every request, so it cannot leak into the next expose().
+        """
+        if requested <= 1:
+            return
+        self.abort.set()
+        self.log.error(
+            "%d frames requested, %d taken: the camera stopped delivering and "
+            "re-opening it did not help, so the rest of the batch is cancelled. "
+            "Power-cycle the camera -- a USB re-plug is not always enough -- and "
+            "check the log for libusb aborts on the image endpoint. If another "
+            "process has this camera open that looks identical from here: the "
+            "SDK does not refuse a second opener.",
+            requested,
+            self._frames_taken,
+        )
+
     def _build_readout_modes(self, props: POACameraProperties) -> None:
         """One readout mode per hardware binning the camera reports.
 
@@ -287,14 +402,43 @@ class PlayerOneCamera(CameraBase):
 
     @override
     def control(self) -> bool:
-        """Report temperature changes. Nothing in CameraBase fires this event."""
-        if self._camera is None:
+        """Report temperature changes. Nothing in CameraBase fires this event.
+
+        This runs unlocked on its own thread -- chimera says so explicitly, and
+        says keeping it thread-safe is the implementer's job. It deliberately
+        does **not** skip while an exposure is running: INDIGO's driver for this
+        same hardware reads temperature throughout the integration and only locks
+        itself out of the readout, and blanking a temperature widget for the
+        length of a whole multi-frame batch would be a far worse cure than the
+        disease. `read_if_idle` gives exactly that shape for free -- during
+        integration the library lock is free almost all the time, and during the
+        frame transfer this skips a tick rather than waiting.
+        """
+        camera = self._camera
+        if camera is None:
             return True
         try:
-            temperature = self._camera.temperature
-        except POAError:
-            self.log.debug("temperature read failed", exc_info=True)
+            temperature = camera.read_if_idle(
+                "temperature", timeout=_TEMPERATURE_POLL_TIMEOUT
+            )
+        except POAError as exc:
+            self._note_temperature_failure(exc)
             return True
+        if temperature is None:
+            self._temperature_polls_skipped += 1
+            return True
+        if self._temperature_failures:
+            self.log.info(
+                "the camera is answering again after %d failed temperature read(s)",
+                self._temperature_failures,
+            )
+            self._temperature_failures = 0
+        if self._temperature_polls_skipped:
+            self.log.debug(
+                "%d temperature poll(s) skipped while the camera was busy",
+                self._temperature_polls_skipped,
+            )
+            self._temperature_polls_skipped = 0
         previous = self._last_temperature
         if (
             previous is None
@@ -305,34 +449,93 @@ class PlayerOneCamera(CameraBase):
                 self.temperature_change(temperature, temperature - previous)
         return True
 
+    def _note_temperature_failure(self, exc: POAError) -> None:
+        """Loud on the first failure, quiet after, loud again if it changes.
+
+        The old code logged this at debug and nothing else, which is why the
+        2026-08-20 session ran for six and a half hours with no idea whether the
+        camera was still answering. Logging every failure instead would spam the
+        log once the camera is genuinely gone, so this reports the first, then
+        only at count crossings or when the error code changes.
+        """
+        self._temperature_failures += 1
+        n = self._temperature_failures
+        if n == 1 or n in (10, 100, 1000) or exc.code != self._last_temperature_code:
+            self._last_temperature_code = exc.code
+            self.log.warning(
+                "temperature read failed (%d in a row): %s", n, exc, exc_info=(n == 1)
+            )
+
     # -- exposure ---------------------------------------------------------
 
     def _expose(self, image_request: ImageRequest) -> CameraStatus:
-        """Arm the camera and wait out the exposure. Called by CameraBase."""
-        camera = self._require_camera()
+        """Arm the camera and wait out the exposure. Called by CameraBase.
+
+        One retry, and **only ever after a successful reconnect**. Retrying
+        against the same handle is precisely the behaviour being removed here: on
+        2026-08-20 five frames failed identically, 20 s each, because nothing
+        between them changed.
+        """
+        self._require_camera()
+        if image_request is not self._current_request:
+            # CameraBase reuses one ImageRequest for every frame of a batch, so
+            # a new object is the only signal this driver gets that a new
+            # request has started.
+            self._current_request = image_request
+            self._frames_taken = 0
         self.expose_begin(image_request)
+        attempts_left = int(self["reconnect_attempts"])
         status = CameraStatus.OK
         try:
-            geometry = self._configure_for(image_request)
-            exptime = float(image_request["exptime"])
-            self._frame_geometry = geometry
-            self._frame_started_at = camera.begin_exposure(exptime)
-            # Sampled at shutter open rather than readout: on a cooled camera
-            # mid-exposure drift is small, but a readout-time sample is wrong by
-            # the whole exposure and biased one way.
-            self._frame_temperature = camera.temperature
-            camera.wait_for_image(
-                exptime, self.abort, margin=float(self["exposure_timeout_margin"])
-            )
-        except ExposureAbortedError:
-            status = CameraStatus.ABORTED
-            self.log.info("exposure aborted")
-        except POAError:
-            status = CameraStatus.ERROR
-            self.log.exception("exposure failed")
+            while True:
+                try:
+                    self._attempt_exposure(image_request)
+                    status = CameraStatus.OK
+                    break
+                except ExposureAbortedError:
+                    status = CameraStatus.ABORTED
+                    self.log.info("exposure aborted")
+                    break
+                except POAError as exc:
+                    status = CameraStatus.ERROR
+                    # Anything that is not a transport failure -- an unknown
+                    # image format, a window out of range, a permissions problem
+                    # -- is not something re-opening the camera can fix, and
+                    # retrying it would turn one bad config into a reconnect
+                    # storm.
+                    if (
+                        not exc.is_transport
+                        or attempts_left <= 0
+                        or not self._reconnect(exc)
+                    ):
+                        self.log.exception("exposure failed")
+                        break
+                    attempts_left -= 1
+                    self.log.warning("retrying the frame on the re-opened camera")
         finally:
+            self._frame_status = status
             self.expose_complete(image_request, status)
         return status
+
+    def _attempt_exposure(self, image_request: ImageRequest) -> None:
+        """One arming and one wait. Raises; the retry policy lives in `_expose`."""
+        camera = self._require_camera()
+        geometry = self._configure_for(image_request)
+        exptime = float(image_request["exptime"])
+        self._frame_geometry = geometry
+        # Sampled at shutter open rather than readout: on a cooled camera
+        # mid-exposure drift is small, but a readout-time sample is wrong by
+        # the whole exposure and biased one way.
+        #
+        # Taken *before* arming rather than just after, which is where it used
+        # to be. A millisecond either side of the shutter is astronomically
+        # identical, and this keeps the driver's own config read out of the
+        # window where the SDK has bulk transfers pending on the image endpoint.
+        self._frame_temperature = camera.temperature
+        self._frame_started_at = camera.begin_exposure(exptime)
+        camera.wait_for_image(
+            exptime, self.abort, margin=float(self["exposure_timeout_margin"])
+        )
 
     def _readout(self, image_request: ImageRequest) -> Image | None:
         """Fetch the frame and hand it to chimera. Called by CameraBase."""
@@ -340,6 +543,15 @@ class PlayerOneCamera(CameraBase):
         self.readout_begin(image_request)
         if self.abort.is_set():
             self.readout_complete(None, CameraStatus.ABORTED)
+            return None
+        if self._frame_status is not CameraStatus.OK:
+            # CameraBase._base_expose throws away what _expose returned and calls
+            # this anyway, so on 2026-08-20 every failed frame produced a second
+            # traceback from POAGetImageData -- fetching pixels the exposure had
+            # already reported were not there, and paying the transfer timeout to
+            # find out. The events still fire; only the bus traffic is skipped.
+            self.readout_complete(None, self._frame_status)
+            self._stop_remaining_frames(int(image_request["frames"]))
             return None
         try:
             (
@@ -353,9 +565,15 @@ class PlayerOneCamera(CameraBase):
                 image_request["binning"], image_request["window"]
             )
             pixels = camera.read_frame(self._frame_geometry)
-        except POAError:
+        except POAError as exc:
             self.log.exception("readout failed")
             self.readout_complete(None, CameraStatus.ERROR)
+            if exc.is_transport:
+                # The pixels went with the pipe and there is nothing to re-read,
+                # but the *next* frame the observer asks for should find a
+                # healthy camera rather than repeating this.
+                self._reconnect(exc)
+            self._stop_remaining_frames(int(image_request["frames"]))
             return None
 
         image = self._save_image(
@@ -372,6 +590,7 @@ class PlayerOneCamera(CameraBase):
         if self.abort.is_set():
             self.readout_complete(None, CameraStatus.ABORTED)
             return None
+        self._frames_taken += 1
         self.readout_complete(image.url(), CameraStatus.OK)
         return image
 
@@ -408,15 +627,40 @@ class PlayerOneCamera(CameraBase):
         return self._camera
 
     # -- cooling ----------------------------------------------------------
+    #
+    # **These six are @lock in CameraBase and deliberately not here.** That is a
+    # decision, not an oversight, and it is easy to "fix" back: an override
+    # replaces the base method and the base's @lock marker does not come with
+    # it, so nothing warns. (@lock and @override compose fine in either order --
+    # typing.override sets an attribute and returns the same function.)
+    #
+    # The reason is grain. Every SDK call is now serialised one at a time by the
+    # library lock in bindings.py, and the two-call cooling sequence holds that
+    # lock as a transaction inside Camera.start_cooling, so nothing here needs
+    # more. What @lock would add is chimera's per-object monitor and FIFO lane --
+    # and `expose` holds those for the *entire* _base_expose loop, all frames
+    # plus intervals, with no default request timeout on the bus. A status panel
+    # calling get_temperature would freeze for minutes with no error. INDIGO
+    # reaches the same place from the other side: rather than queue device
+    # access behind a frame, it refuses it outright.
+    #
+    # The readers additionally fall back to the last value they saw rather than
+    # waiting on a frame transfer, so a widget never blocks and never goes blank.
 
     @override
     def start_cooling(self, temp_c: float) -> bool:
         self._require_camera().start_cooling(float(temp_c))
+        # Remembered so a reconnect restores what is actually in force. Restoring
+        # from config instead would silently revert a setpoint the observer set
+        # at run time, at the moment they were least likely to look.
+        self._cooling_setpoint = float(temp_c)
+        self._last_set_point = float(temp_c)
         return True
 
     @override
     def stop_cooling(self) -> bool:
         self._require_camera().stop_cooling()
+        self._cooling_setpoint = None
         return True
 
     @override
@@ -425,11 +669,29 @@ class PlayerOneCamera(CameraBase):
 
     @override
     def get_temperature(self) -> float:
-        return self._require_camera().temperature
+        camera = self._require_camera()
+        value = camera.read_if_idle("temperature", timeout=_TEMPERATURE_POLL_TIMEOUT)
+        if value is None:
+            # Busy transferring a frame. The last reading is seconds old at
+            # worst; blocking here is what we are avoiding.
+            if self._last_temperature is not None:
+                return self._last_temperature
+            return camera.temperature
+        self._last_temperature = value
+        return value
 
     @override
     def get_set_point(self) -> float:
-        return self._require_camera().target_temperature
+        camera = self._require_camera()
+        value = camera.read_if_idle(
+            "target_temperature", timeout=_TEMPERATURE_POLL_TIMEOUT
+        )
+        if value is None:
+            if self._last_set_point is not None:
+                return self._last_set_point
+            return camera.target_temperature
+        self._last_set_point = value
+        return value
 
     @override
     def start_fan(self, rate: int | None = None) -> bool:

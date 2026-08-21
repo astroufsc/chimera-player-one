@@ -24,7 +24,7 @@ import pytest
 
 from chimera_player_one.sdk.bindings import CameraSdk
 from chimera_player_one.sdk.camera import Camera
-from chimera_player_one.sdk.enums import POAImgFormat
+from chimera_player_one.sdk.enums import POAConfig, POAImgFormat
 from chimera_player_one.sdk.errors import POAError
 from chimera_player_one.sdk.simulator import (
     ARES_M_PRO,
@@ -258,6 +258,60 @@ class TestFakeAgreesWithHardware:
             "the fake and the hardware disagree about ROI geometry; the fake is "
             f"wrong until proven otherwise.\n  fake: {fake}\n  real: {real}"
         )
+
+
+class TestReopenOnHardware:
+    """The reconnect path, against a real camera.
+
+    `Camera.reopen` exists because of 2026-08-20, when a camera stopped
+    delivering frames while still answering every config read, and the only cure
+    anyone had was to walk over and unplug it. Two of its assumptions can only be
+    checked here.
+    """
+
+    def test_reopen_keeps_the_same_camera(self, camera):
+        """Camera IDs are enumeration indices, so a reconnect that re-selected by
+        index could hand back the other camera under this one's name."""
+        serial = camera.properties.serial
+        camera.reopen()
+        assert camera.properties.serial == serial
+
+    def test_reopen_resets_the_camera(self, camera):
+        """**The fake's biggest inferred claim, measured.**
+
+        `_POAInitCamera` in the simulator resets config and geometry because the
+        header calls POAInitCamera "initialize the camera's hardware, parameters,
+        and malloc memory". Nothing measured that. If the real camera does *not*
+        reset, `_restore_settings` after a reconnect is merely redundant rather
+        than load-bearing -- and every test that proves it re-applies settings is
+        proving something about the fake and nothing about the camera.
+
+        The fake has been wrong about exactly this kind of assumption twice
+        before. Whichever way this lands, record it in BUILD-LOG.
+        """
+        camera.configure(binning=2)
+        attributes = camera._sdk.get_config_attributes_by_id(  # noqa: SLF001
+            camera.camera_id, POAConfig.POA_GAIN
+        )
+        default_gain = int(attributes.defaultValue.intValue)
+        distinctive = default_gain + 100
+        camera.gain = distinctive
+        assert camera.gain == distinctive
+
+        camera.reopen()
+
+        assert camera.gain != distinctive, (
+            "POAInitCamera did NOT reset gain on this camera -- the fake's "
+            "reset behaviour is wrong and _restore_settings is redundant. "
+            "Update the simulator and BUILD-LOG."
+        )
+        assert camera.geometry().binning == 1
+
+    def test_a_reopened_camera_still_takes_frames(self, camera):
+        camera.reopen()
+        geometry = camera.configure(binning=4, image_format=POAImgFormat.POA_RAW16)
+        exposure = camera.expose(0.01)
+        assert exposure.data.shape == (geometry.height, geometry.width)
 
 
 def test_a_fake_spec_exists_for_every_attached_camera():
